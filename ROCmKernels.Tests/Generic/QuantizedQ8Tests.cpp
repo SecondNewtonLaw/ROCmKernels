@@ -105,6 +105,33 @@ namespace {
         }
     }
 
+    void RunLargeMagnitudeRoundTrip() {
+        using namespace ROCmKernels::Kernels;
+
+        std::vector<float> host(kQ8Block, 0.0f);
+        host[0] = 1.0e7f;
+        host[1] = -1.0e7f;
+        host[2] = 1.0e6f;
+
+        ROCmKernels::DeviceBuffer<float> deviceInput(kQ8Block);
+        ROCmKernels::DeviceBuffer<BlockQ8_0> deviceBlocks(1);
+        ROCmKernels::DeviceBuffer<float> deviceOutput(kQ8Block);
+        deviceInput.CopyFromHost(host.data(), host.size());
+
+        QuantizeQ8_0(deviceInput.Data(), deviceBlocks.Data(), kQ8Block);
+        DequantizeQ8_0(deviceBlocks.Data(), deviceOutput.Data(), kQ8Block);
+        ROCMKERNELS_HIP_CHECK(hipDeviceSynchronize());
+
+        std::vector<BlockQ8_0> blocks(1);
+        std::vector<float> actual(kQ8Block);
+        deviceBlocks.CopyToHost(blocks.data(), blocks.size());
+        deviceOutput.CopyToHost(actual.data(), actual.size());
+
+        CHECK(__half2float(blocks[0].scale) == 65504.0f);
+        for (int index = 0; index < kQ8Block; ++index) CHECK(std::isfinite(actual[index]));
+        CheckRelative(host, actual, 0.25);
+    }
+
     void RunZeroBlock() {
         using namespace ROCmKernels::Kernels;
 
@@ -186,6 +213,7 @@ TEST_CASE("Q8_0 quantize and dequantize round trip", "[generic][quantized]") {
     SECTION("32 elements") { RunRoundTrip(32, 1101); }
     SECTION("128 elements") { RunRoundTrip(128, 1201); }
     SECTION("small magnitude block") { RunSmallMagnitudeRoundTrip(1301); }
+    SECTION("large magnitude block") { RunLargeMagnitudeRoundTrip(); }
     SECTION("zero block") { RunZeroBlock(); }
 }
 

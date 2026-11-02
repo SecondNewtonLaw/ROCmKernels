@@ -19,6 +19,8 @@ namespace {
     constexpr int kDequantizeThreads = 256;
     // Smallest positive fp16 scale, used when a nonzero block would otherwise round to zero.
     constexpr float kMinimumScale = 5.9604644775390625e-8f;
+    // Largest finite fp16 scale, beyond which the stored scale would become infinity.
+    constexpr float kMaximumScale = 65504.0f;
 
     __device__ __forceinline__ float warp_sum(float value) {
         #pragma unroll
@@ -47,7 +49,8 @@ namespace {
 
         const float value = input[block * kQ8Block + lane];
         const float maximum = warp_max(fabsf(value));
-        __half scale = __float2half_rn(maximum / 127.0f);
+        const float requestedScale = maximum / 127.0f;
+        __half scale = __float2half_rn(requestedScale > kMaximumScale ? kMaximumScale : requestedScale);
         if (maximum > 0.0f && __half2float(scale) == 0.0f) scale = __float2half_rn(kMinimumScale);
 
         // Quantize against the stored scale so dequantization reproduces the block.
