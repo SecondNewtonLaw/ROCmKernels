@@ -10,6 +10,7 @@ The following kernels are ports or adaptations of code from
 - `ROCmKernels.Kernels/src/Generic/Retrieval/TopK.hip` (from `top-k.cu` and `argsort.cu`)
 - `ROCmKernels.Kernels/src/Generic/Linear/LinearActVec.hip` (from `mmvf.cu`)
 - `ROCmKernels.Kernels/src/Generic/Loss/Softmax.hip` (from `softmax.cu`)
+- `ROCmKernels.Kernels/src/Generic/Quantized/QuantizedQ8.hip` (from `dequantize.cuh`, `vecdotq.cuh` and `quantize.cu`)
 
 MIT License
 
