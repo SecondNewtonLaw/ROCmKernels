@@ -1,9 +1,164 @@
 ---
 name: profile-kernel
-description: Profile a gfx1031 HIP kernel by loading its HIP-compiled code object through the OpenCL runtime and capturing instruction-level SQTT data with Radeon GPU Profiler. Use when per-instruction timing, stall attribution or hardware counters are needed and direct HIP capture crashes.
+description: Review a gfx1031 HIP kernel's performance and decide what to change, from wall-time baseline through ISA inspection to RGP instruction traces captured via the OpenCL runtime. Use when a kernel is slower than torch or a previous build, before optimizing one, or when per-instruction timing or stall attribution is needed.
 ---
 
 # Profile Kernel
+
+## Tuning loop
+
+Tuning is a loop of predict, apply, measure, explain. The goal of each pass is not only a faster
+kernel but a smaller gap between what you predicted and what you measured. A pass whose result you
+cannot explain has taught you nothing, even if it made the kernel faster.
+
+```
+model of the kernel -> hypothesis -> predicted effect -> one change -> measurement
+        ^                                                                   |
+        +------------- explain the error, correct the model <---------------+
+```
+
+### 1. Set the target before touching code
+
+Work out the ceiling, so you know how far there is to go and which wall you are against.
+
+- **FLOPs and bytes per call.** A GEMM is `2*M*N*K` FLOP; bytes are what each operand costs to read
+  once plus the output write. Intensity = FLOP / byte.
+- **Ceilings on this card:**
+
+  | resource | ceiling |
+  | --- | --- |
+  | fp16 `v_dot2` compute | 36 CU x 64 lanes x 4 flop x ~2.6 GHz, about 24 TFLOP/s |
+  | fp32 FMA compute | about 12 TFLOP/s |
+  | DRAM bandwidth | 320 GB/s |
+  | CUs | 36 (the runtime reports 18, the WGP count) |
+
+- **Bound:** time at the bandwidth ceiling vs time at the compute ceiling. The larger is the wall.
+- **Grid:** blocks vs 36 CUs. Under about 2 blocks per CU, the grid is the wall. No inner-loop work
+  fixes that: change the tile, or split K. Example: `down` at M=2048 runs 32 blocks of 64x128 on
+  36 CUs, so 4 CUs idle and each block runs alone.
+- **Target:** torch's time on the same shapes, then 50 to 60% of the ceiling. Write both down.
+
+### 2. Measure so the numbers mean something
+
+- **Same process, same run, torch beside ours.** Clocks drift with temperature and power. Torch is
+  the control: if torch moved 5%, a 5% move of ours is noise. Judge with the ratio `ours / torch`,
+  not raw ms across runs.
+- **Protocol:** warm up 10 calls, then 7 batches of 100 calls timed with `torch.cuda.Event`; report
+  the median batch. For final numbers use `tools/TorchCompare/compare_ops.py` (cold cache, median of
+  20).
+- **Noise floor:** rerun the unchanged build once. The spread between those two runs is your noise.
+  Here it was 3 to 5%. A change smaller than the noise is not a result; rerun before accepting or
+  rejecting it.
+- **Correctness every run.** Print a max error against a reference in the benchmark itself and run
+  the kernel's tests after every build. A fast wrong kernel looks like a win.
+- **Check the build succeeded before benchmarking.** A failed build leaves the old DLL in place and
+  the benchmark measures the previous variant. This happened during the fp16 GEMM work: the numbers
+  looked plausible and were stale.
+- **Every shape, every instance.** Template instances share helpers. A change aimed at one shape
+  moves the others, so the table always has every production shape.
+
+### 3. Build the model from the ISA
+
+Before predicting, know what the kernel does per instruction.
+
+```powershell
+$env:VIRTUAL_ENV='F:\rocm-test\venv'
+.\scripts\Disassemble.ps1 -Source <kernel.hip> -Output build\isa\<name>.s `
+  -IncludePath ROCmKernels.Kernels\include,ROCmKernels.Common\include
+Select-String build\isa\<name>.s -Pattern '\.(vgpr_count|vgpr_spill_count|group_segment_fixed_size|name):'
+```
+
+In the metadata block the fields come before `.name`. Per template instance, write down:
+
+- **Resources:** VGPRs, spills (must be 0), and LDS bytes.
+- **Occupancy:** waves per SIMD32 = min(1024 / VGPRs rounded up to 8, LDS limit, block limit).
+  With 256-thread blocks, a block is 8 waves spread over the CU's 2 SIMD32s. Going from 64 to 94
+  VGPRs drops the VGPR limit from 16 to 10 waves per SIMD. That matters only when the grid has
+  enough blocks to fill it.
+- **Hot loop:** count instructions per K step. In a GEMM the ideal is the `v_dot2` count with
+  little else. Count `ds_read`, `global_load`, `s_waitcnt` and `s_barrier`. The ratio of dot2 to
+  everything else is the first-order efficiency.
+- **Widths:** global loads should be `global_load_dwordx4` and shared reads `ds_read_b128` or `b64`.
+  A run of `ds_read_u16` or `ds_write_b16` is the layout fighting you.
+- **Bank math on paper.** For each shared store pattern, compute `bank = (byte address / 4) % 32`
+  for the 32 lanes of one wave. Same bank with different addresses serializes the write. Example:
+  with a 16-byte row pitch, rows 8 apart land in the same bank, so a transpose store
+  `tile[col + e][k]` across 16 column groups is 16-way conflicted.
+
+### 4. Pick the knob in this order
+
+Higher items usually move more and invalidate tuning below them, so settle them first.
+
+1. **Parallelism:** tile shape, split-K, blocks per CU. Detect with the grid arithmetic from step 1.
+2. **Global access:** coalescing, 16-byte vectors, alignment checks (`Vectorizable`), reading each
+   operand once. Detect with GB/s against 320 and `global_load` width.
+3. **Shared layout:** bank conflicts on stores, row pitch a multiple of 16 B, `__align__(16)`, wide
+   reads. Detect with bank math and `ds_*` widths.
+4. **Latency hiding:** register prefetch of the next tile, double buffering, occupancy. Detect with
+   load, sync, compute in series in the ISA; RGP shows it as VMEM waits.
+5. **Instruction selection:** `v_dot2`, packed math, plain `asm` vs `asm volatile` vs builtin.
+   Detect with the instruction counts.
+6. **Epilogue:** vector stores, fused activation. It matters only when K is small.
+
+### 5. One change, a written prediction, then measure
+
+Before building, write down: the change, the mechanism, and the expected direction and size for
+**each** shape. Example: "plain asm `dot2`: LDS reads can be hoisted; expect up and dh 3 to 5%
+faster and no change in register count."
+
+Then compare the measurement with the prediction:
+
+| result | meaning | action |
+| --- | --- | --- |
+| Matches in direction and size | Model is right | Keep it, take the next knob |
+| Right direction, much smaller | Another limit dominates | Find that limit before stacking more on this knob |
+| Wrong direction or several times off | Model is wrong | Stop. Read the ISA diff until you can explain it. Do not add the next change on top |
+| Helps some shapes, hurts others | The knob has a cost that scales with something | Find the variable (VGPRs, tile size, K) and gate the change on it with a measured threshold |
+
+Worked examples from the fp16 GEMM:
+
+- **Builtin `dot2`:** predicted a small win, measured 4.5x slower. That error was far too big to be
+  scheduling. The ISA diff showed new merged `ds_read_b128` on a 68-byte pitch, which is misaligned.
+  The model was corrected (b128 needs 16-byte alignment) and the pitch was fixed.
+- **Pitch fix:** predicted a return to baseline, measured still slower. Bank math showed the
+  transpose store had become 16-way conflicted, so the store layout was changed next.
+- **Two changes at once regressed:** they were separated by reverting one (`asm` without
+  `volatile` on the new layout) to see what each did.
+- **Register prefetch:** `down` went 0.707 to 0.568 ms, but `up` and `dh` regressed. Their tiles
+  stage 6 vectors per thread against 3 to 4 for the others, so prefetch was gated to 4 vectors or
+  fewer.
+- **Forcing occupancy** with `amdgpu_waves_per_eu`: predicted a win from more waves, measured none,
+  and the compiler could not meet the target anyway. Reverted: higher occupancy was not the limit.
+
+### 6. Known gfx1031 traps
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| LDS reads do not overlap math | `asm volatile` is a scheduling barrier | Plain `asm` or a builtin for pure math |
+| Merged `ds_read_b128` much slower | Row pitch not a multiple of 16 B | Pad the pitch by 8 halves and add `__align__(16)` |
+| Transpose store `tile[n][k]` slow | 16 B pitch puts rows 8 apart in one bank | Stage k-major data as `half2` k-pairs `tile[k/2][n]` |
+| Epilogue is many scalar stores | Thread owns strided columns | Give each thread adjacent columns and store vectors |
+| Load, sync, compute in series | No overlap of global latency | Prefetch the next tile into registers, if VGPRs allow |
+| Fewer blocks than CUs | Tile too large for the shape | Smaller tile or split-K |
+| Change fixes one config, hurts another | Register cost differs per instance | Gate on a compile-time cost, set by measurement |
+
+### 7. Use RGP when the static view runs out
+
+If step 3 cannot explain the gap, capture an instruction trace (rest of this skill). Look at VMEM
+wait cycles, LDS stalls and issue gaps around `s_barrier`.
+
+### 8. Keep the log, commit only a net win
+
+- Keep a table per pass: change, prediction, ours and torch per shape, explanation. It is the
+  record of how the model improved and it stops anyone retrying a dead end.
+- Commit only when the change is faster across the production shapes, or the regressions are
+  understood and accepted, and the tests pass. Otherwise revert.
+- A lesson that held up (an alignment rule, a cost, a threshold) goes into
+  `.opencode/skills/write-isa/references/rdna2-isa.md`, so the next pass starts with a better
+  model.
+- Report the per-shape table for ours, torch and the baseline, and name every regression.
+
+## RGP capture path
 
 Radeon GPU Profiler cannot trace the HIP runtime used by this project: enabling tracing kills the
 process with an access violation. It can trace OpenCL on the same card. Both runtimes consume the

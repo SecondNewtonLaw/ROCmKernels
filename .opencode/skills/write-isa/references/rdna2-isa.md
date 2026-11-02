@@ -16,13 +16,15 @@ Sources:
 
 - A WGP contains two CUs. `hipDeviceProp.multiProcessorCount` reports **18 on this card**, which is
   the WGP count; the hardware has 36 CUs. Account for this when converting a grid to waves per CU.
-- A CU has four SIMD16 units and 64 stream processors. A wave32 instruction occupies a SIMD16 for
-  two cycles, so one wave32 issues at most one instruction per two cycles per SIMD. Several waves
-  per SIMD are needed to fill issue slots.
+- A CU has two SIMD32 units and 64 stream processors; a WGP has four SIMD32. A wave32 VALU
+  instruction issues in one cycle on its SIMD32 in the ideal case (GCN's four SIMD16 with four-cycle
+  issue is the older model). The measured single-wave interval is ~1.75 cycles (see below), so one
+  wave does not fill its SIMD.
 - RDNA2 is wave32-native and also supports wave64. Kernels in this repository are wave32.
-- LDS is 64 KB per CU (128 KB per WGP). It is 32 banks of 32 bits. On this card reads are served by a
-  crossbar that handles any 32-lane pattern without a bank penalty; writes are banked and
-  same-bank stores serialize (see the measured table below).
+- LDS is 64 KB per CU (128 KB per WGP). It is 32 banks of 32 bits. The `ds_read_b32` microbenchmark
+  showed no read bank penalty at any stride, while writes serialize on same-bank addresses (see the
+  measured table below). AMD's guides describe read conflicts too, so treat the read result as
+  specific to the b32 test and re-measure before relying on it for wide reads.
 - VGPRs are allocated per wave in granularity. The compiler reports the real count as
   `.amdhsa_next_free_vgpr` in the assembly and `vgpr_count` in the code-object metadata. Use those,
   not a guessed budget. SGPRs are separate and hold uniform values, descriptors and lane selects.
@@ -36,16 +38,16 @@ Sources:
 | --- | ---: | --- |
 | `VOP1` | 32 | one vector source: `v_mov`, `v_cvt`, `v_exp`, `v_rcp`, `v_sqrt` |
 | `VOP2` | 32 | two vector sources: `v_add_f32`, `v_mul_f32`, `v_and_b32`, `v_lshlrev_b32` |
-| `VOP3` | 64 | three sources, modifiers, or a VGPR destination that VOP1/VOP2 cannot encode |
-| `VOP3P` | 64 | packed fp16 and dot products: `v_pk_fma_f16`, `v_dot2_f32_f16`, `v_dot4c_i32_i8` |
+| `VOP3` | 64 | three sources, modifiers, or an SGPR destination (compares, `v_readlane_b32`) |
+| `VOP3P` | 64 | packed fp16 and three-operand dots: `v_pk_fma_f16`, `v_dot2_f32_f16` |
 | `VOPC` | 32 | vector compare producing VCC |
 | `SOP1` / `SOP2` | 32 | scalar ALU and moves |
 | `SOPC` | 32 | scalar compare |
 | `SOPK` | 32 | scalar with a 16-bit immediate |
 | `SOPP` | 32 | control: branch, waitcnt, barrier, endpgm |
 | `SMEM` | 64 | scalar memory: `s_load_dword`, `s_buffer_load_dword` |
-| `MUBUF` / `MTBUF` | 64 | buffer load/store (the usual global path) |
-| `FLAT` / `GLOBAL` / `SCRATCH` | 64 | flat, global and private memory |
+| `MUBUF` / `MTBUF` | 64 | buffer load/store through a resource descriptor |
+| `FLAT` / `GLOBAL` / `SCRATCH` | 64 | flat, global and private memory; HIP global pointers compile to `global_*` |
 | `DS` | 64 | LDS: `ds_read_b32/b64/b128`, `ds_write`, `ds_bpermute`, atomics |
 | `EXP` | 64 | export to the graphics pipeline (not used in compute here) |
 | `MIMG` | 64 | image sample/load (not used in compute here) |
@@ -90,13 +92,15 @@ those are CDNA or RDNA3+.
 | --- | --- |
 | `v_pk_add_f16`, `v_pk_mul_f16`, `v_pk_fma_f16` | two fp16 operations per 32-bit register |
 | `v_pk_add_f32` | packed fp32 add (two fp32 values in a pair of registers) |
-| `v_dot2_f32_f16` | `dst = src0.x*src1.x + src0.y*src1.y + dst` in fp32; two MACs per instruction |
+| `v_dot2_f32_f16` | VOP3P: `dst = src0.x*src1.x + src0.y*src1.y + src2` in fp32; two MACs per instruction |
+| `v_dot2c_f32_f16` | VOP2 form of the same dot; the destination is also the accumulator |
 | `v_dot2_i32_i16` | two signed 16-bit products into an integer accumulator |
-| `v_dot4c_i32_i8` | four signed int8 products into an int32 accumulator; `c` means the destination is also the accumulator |
+| `v_dot4c_i32_i8` | VOP2: four signed int8 products into an int32 accumulator; `c` means the destination is also the accumulator |
 | `v_dot8_i32_i4` | eight signed int4 products into an int32 accumulator |
 
-`v_dot2_f32_f16` is the reason the fp16 GEMM reaches 8.5 TFLOP/s while the fp32 path stays at
-5.25. `v_dot4c_i32_i8` is emitted automatically for the Q8_0 dot product.
+`v_dot2_f32_f16` is the reason the fp16 GEMM reaches 9.5-10 TFLOP/s while the fp32 path stays at
+5.25. The fp16 dot2 peak is `36 CU * 64 lanes * 4 flop * clock`, about 24 TFLOP/s at 2.6 GHz.
+`v_dot4c_i32_i8` is emitted automatically for the Q8_0 dot product.
 
 ### Scalar ALU and control
 
@@ -137,11 +141,10 @@ those are CDNA or RDNA3+.
 
 Cache modifiers on loads/stores:
 
-- `glc` (global level coherent): bypass L0 for that access.
-- `slc` (system level coherent): bypass L1/L2 where applicable.
-- `dlc` (device level coherent): force L2 visibility.
-- `sc0/sc1`, `nt` and `da` exist on some forms; prefer the compiler's choices unless a measured
-  cache-policy experiment justifies changing them.
+- `glc`, `slc` and `dlc` are the RDNA2 cache-policy bits. Their exact per-level meaning differs
+  between loads, stores and atomics; see the RDNA2 ISA guide before relying on one.
+- `sc0`, `sc1` and `nt` are CDNA3 (gfx940+) bits and `da` is a GCN image bit; none exist on gfx1031.
+- Prefer the compiler's choices unless a measured cache-policy experiment justifies changing them.
 
 ## Hazards and ordering
 
@@ -159,11 +162,17 @@ Cache modifiers on loads/stores:
 - MUFU results (`v_exp_f32`, `v_rcp_f32`, `v_sqrt_f32`) have a longer latency; measured ~11 cycles
   for `v_exp_f32`. Do not put a MUFU result on the critical path of every iteration if it can be
   hoisted or overlapped.
-- A wave32 instruction occupies a SIMD16 for two cycles. Two waves per SIMD are the minimum to
-  hide the issue interval; more waves hide memory and MUFU latency.
+- One wave issues independent VALU work at ~1.75 cycles against an ideal of one. Run at least two
+  waves per SIMD32 to fill issue slots; more waves also hide memory and MUFU latency.
 - Inline asm is opaque to the scheduler. Put independent instructions in separate asm blocks, or
-  write the whole unrolled sequence in one block and schedule it yourself. `asm volatile` prevents
-  the compiler from deleting or reordering it.
+  write the whole unrolled sequence in one block and schedule it yourself.
+- `asm volatile` keeps its order against other volatile asm and side effects, which in practice
+  stops LLVM from hoisting LDS reads past it. A pure-math wrapper such as `dot2` should be plain
+  `asm` (no `volatile`) or a builtin. On the fp16 GEMM, dropping `volatile` from `dot2` made the
+  128x64 tiles 4-5% faster.
+- `ds_read_b64` needs an 8-byte-aligned address and `ds_read_b128` a 16-byte-aligned one. A
+  misaligned `ds_read_b128`, produced when the compiler merged reads over a 68-byte row pitch, made
+  the fp16 GEMM 4.5x slower. Pad shared rows to a multiple of 16 bytes and declare `__align__(16)`.
 - Inline asm that touches a register implicitly must declare it. `s_add_u32`, `s_subb_u32` and every
   VALU compare write flags the compiler does not see. At minimum `s_add_u32`/`s_sub_u32` need an
   `"scc"` clobber, otherwise the scheduler will move a loop compare across them and the loop will
@@ -201,11 +210,12 @@ operations per iteration. The loop overhead is included and is visible in the `v
 
 The issue interval is flat at ~1.75 cycles for every VALU encoding, VOP1 through VOP3P. There is no
 throughput advantage to a 32-bit encoding over a 64-bit one; pick instructions by work done, not by
-encoding width. At the measured 2.64 GHz this is two cycles per wave32 instruction per SIMD16, so a
-CU issues at most two wave32 instructions per cycle across its four SIMD16 units.
+encoding width. A SIMD32 can issue one wave32 VALU instruction per cycle, so a single wave leaves
+roughly 40% of its SIMD idle.
 
-One wave reaches the same per-wave issue interval as four waves (1.78 / 1.79 / 1.75), so a single
-wave already saturates its SIMD16. More waves hide memory and MUFU latency, not issue.
+Four waves showed the same per-wave interval as one (1.78 / 1.79 / 1.75). A 128-thread block
+spreads over the WGP's four SIMD32s, so this does not show whether two waves on one SIMD fill the
+gap. Measure that with a block of at least eight waves before drawing an occupancy conclusion.
 
 ### LDS
 
@@ -249,8 +259,10 @@ loads should use 128-bit reads where the layout allows it.
 | 32 MB working set | 560 | |
 | DRAM, 256 MB working set | 470 | |
 
-The knee is between 1 MB and 8 MB. The 96 MB infinity cache does not produce a measurable latency
-step for this pattern on this card; treat anything above the L2 as DRAM-latency.
+The knee is between 1 MB and 8 MB. The RX 6700 has 80 MB of infinity cache, but this chase shows
+no step for it and is not monotonic (32 MB costs more than 256 MB). A fixed 128-byte stride is
+open to prefetch and TLB effects, so this table bounds L1 and L2 only. Rerun with a randomized
+chase before using the numbers above L2.
 
 ### fp8 on gfx1031
 
