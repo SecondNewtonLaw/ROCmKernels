@@ -21,8 +21,8 @@ namespace {
         const T *source = table + static_cast<std::size_t>(target) * columns;
         T *destination = output + static_cast<std::size_t>(row) * columns;
 
-        for (int column = static_cast<int>(blockIdx.y) * static_cast<int>(blockDim.x) + static_cast<int>(threadIdx.x); column < columns;
-                column += static_cast<int>(gridDim.y) * static_cast<int>(blockDim.x)) {
+        for (std::size_t column = static_cast<std::size_t>(blockIdx.y) * blockDim.x + threadIdx.x; column < static_cast<std::size_t>(columns);
+                column += static_cast<std::size_t>(gridDim.y) * blockDim.x) {
             StoreScalar(destination + column, LoadScalar(source + column));
         }
     }
@@ -37,8 +37,8 @@ namespace {
         const T *source = input + static_cast<std::size_t>(row) * columns;
         T *destination = table + static_cast<std::size_t>(target) * columns;
 
-        for (int column = static_cast<int>(blockIdx.y) * static_cast<int>(blockDim.x) + static_cast<int>(threadIdx.x); column < columns;
-                column += static_cast<int>(gridDim.y) * static_cast<int>(blockDim.x)) {
+        for (std::size_t column = static_cast<std::size_t>(blockIdx.y) * blockDim.x + threadIdx.x; column < static_cast<std::size_t>(columns);
+                column += static_cast<std::size_t>(gridDim.y) * blockDim.x) {
             StoreScalar(destination + column, LoadScalar(source + column));
         }
     }
@@ -49,8 +49,8 @@ namespace {
         const float *source = input + static_cast<std::size_t>(row) * columns;
         float *destination = table + static_cast<std::size_t>(target) * columns;
 
-        for (int column = static_cast<int>(blockIdx.y) * static_cast<int>(blockDim.x) + static_cast<int>(threadIdx.x); column < columns;
-                column += static_cast<int>(gridDim.y) * static_cast<int>(blockDim.x)) {
+        for (std::size_t column = static_cast<std::size_t>(blockIdx.y) * blockDim.x + threadIdx.x; column < static_cast<std::size_t>(columns);
+                column += static_cast<std::size_t>(gridDim.y) * blockDim.x) {
             atomicAdd(destination + column, source[column]);
         }
     }

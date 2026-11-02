@@ -22,13 +22,13 @@ namespace ROCmKernels::Kernels {
         ROCMKERNELS_HIP_CHECK(get_rows_forward(table, indices, output, rows, columns, dtype, stream));
     }
 
-    /// Overwrites rows: table[indices[r]][c] = input[r][c]. Duplicate indices race, so the last write is unspecified.
+    /// Overwrites rows: table[indices[r]][c] = input[r][c]. indices must be unique; duplicate targets race and the last write is unspecified.
     inline void SetRowsForward(const void *input, const int *indices, void *table, const int rows, const int columns, const DType dtype,
             hipStream_t stream = nullptr) {
         ROCMKERNELS_HIP_CHECK(set_rows_forward(input, indices, table, rows, columns, dtype, stream));
     }
 
-    /// Accumulates rows: table[indices[r]][c] += input[r][c]. Duplicate indices sum, so the order does not matter.
+    /// Accumulates rows: table[indices[r]][c] += input[r][c]. Duplicate indices are safe, but atomic order is unspecified, so rounded sums can vary.
     ///
     /// Only Float32 is supported; Float16 throws because the target has no half atomic add.
     inline void AddRowsForward(const void *input, const int *indices, void *table, const int rows, const int columns, const DType dtype,
