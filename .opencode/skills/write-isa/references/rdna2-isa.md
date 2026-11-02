@@ -252,6 +252,30 @@ loads should use 128-bit reads where the layout allows it.
 The knee is between 1 MB and 8 MB. The 96 MB infinity cache does not produce a measurable latency
 step for this pattern on this card; treat anything above the L2 as DRAM-latency.
 
+### fp8 on gfx1031
+
+There is no fp8 instruction in the RDNA2 opcode list and no fp8 ALU. `__hip_fp8_e4m3`
+compiles to software emulation with NaN and denormal branches (dozens of scalar and
+vector instructions per element). The fast path is a six-integer-op decode per two
+values:
+
+```
+h0 = ((b & 0x80) << 8) | (((b & 0x7f) << 7) + 0x2000)   // E4M3 normal -> fp16
+```
+
+Measured, one wave, dependent chains (`tools/IsaBench`):
+
+| sequence | cycles |
+| --- | ---: |
+| `v_dot2_f32_f16`, native fp16 | 1.76 |
+| E4M3 decode + `v_dot2_f32_f16` (2 MACs) | 12.28 |
+| E4M3 -> fp16 decode, 2 values | 7.59 |
+
+So fp8 is a storage format here, not a compute format: a weight-only fp8 GEMM pays
+roughly three instructions per element to decode, which is about 4x the issue cost of
+the fp16 dot2 it feeds. It only pays when the weights stream from DRAM and the kernel
+is bandwidth-bound; the FFN weights (2 MB each, Infinity-Cache resident) are not.
+
 ### Issue mixing
 
 | sequence | cycles | note |
@@ -301,3 +325,4 @@ script counts VALU, SALU, VMEM, LDS and branch instructions per kernel. For a ke
 - AMD RDNA2 ISA Reference Guide (PDF) for bit-level encoding tables.
 - AMD RDNA Performance Guide for LDS banking, occupancy and cache guidance.
 - `profile-kernel` skill for RGP captures and instruction timing.
+

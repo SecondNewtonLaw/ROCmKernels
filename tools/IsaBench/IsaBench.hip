@@ -635,6 +635,61 @@ namespace {
         if (accumulators[0] == 0.0f || scalar == 0) cycles[1] = 1;
     }
 
+    // ------------------------------------------------------------- fp8 (E4M3)
+
+    // gfx1031 has no fp8 ALU. E4M3 decodes to fp16 in six integer ops per element
+    // (sign, exponent rebias, mantissa shift); this is the cost a weight-only fp8
+    // GEMM pays per two MACs.
+    __device__ __forceinline__ unsigned e4m3x2_to_half2(const unsigned two) {
+        const unsigned lo = two & 0xFFu, hi = (two >> 8) & 0xFFu;
+        const unsigned h0 = ((lo & 0x80u) << 8) | (((lo & 0x7Fu) << 7) + 0x2000u);
+        const unsigned h1 = ((hi & 0x80u) << 8) | (((hi & 0x7Fu) << 7) + 0x2000u);
+        return (h1 << 16) | h0;
+    }
+
+    __device__ __forceinline__ float fp8_dot2(const unsigned a, const unsigned b, const float accumulator) {
+        float result = accumulator;
+        asm volatile("v_dot2_f32_f16 %0, %1, %2, %0" : "+v"(result) : "v"(a), "v"(b));
+        return result;
+    }
+
+    __global__ void fp8_dot2_throughput(const int iterations, unsigned long long *cycles) {
+        float accumulators[8];
+        for (int index = 0; index < 8; ++index) accumulators[index] = 1.0f + index;
+        const unsigned long long start = clock64();
+        #pragma unroll 1
+        for (int iteration = 0; iteration < iterations; ++iteration) {
+            #pragma unroll
+            for (int round = 0; round < 4; ++round) {
+                #pragma unroll
+                for (int index = 0; index < 8; ++index) {
+                    // The decode input depends on the accumulator, so neither the
+                    // decode nor the dot2 can be hoisted out of the loop.
+                    const unsigned source = __float_as_uint(accumulators[index]);
+                    const unsigned value = e4m3x2_to_half2(source);
+                    accumulators[index] = fp8_dot2(value, value, accumulators[index]);
+                }
+            }
+        }
+        const unsigned long long stop = clock64();
+        if (threadIdx.x == 0) cycles[0] = stop - start;
+        if (accumulators[0] == 0.0f) cycles[1] = 1;
+    }
+
+    __global__ void fp8_convert_throughput(const int iterations, unsigned long long *cycles) {
+        unsigned sink[16] = {};
+        for (int index = 0; index < 16; ++index) sink[index] = 0x38383838u + index;
+        const unsigned long long start = clock64();
+        #pragma unroll 1
+        for (int iteration = 0; iteration < iterations; ++iteration) {
+            #pragma unroll
+            for (int index = 0; index < 16; ++index) sink[index] = e4m3x2_to_half2(sink[index] ^ 0x0101u);
+        }
+        const unsigned long long stop = clock64();
+        if (threadIdx.x == 0) cycles[0] = stop - start;
+        if ((sink[0] | sink[7]) == 0) cycles[1] = 1;
+    }
+
     // --------------------------------------------------------- measurement
 
     using Kernel = void (*)(int, unsigned long long *);
@@ -835,6 +890,10 @@ int main() {
     ReportKernel("8 LDS + 16 FMA", mixed_kernel, 24);
     ReportKernel("32 FMA + 32 SALU", salu_valu_mix, 32);
 
+    std::printf("\n-- fp8 (E4M3, no native ALU on gfx1031) --\n");
+    ReportKernel("fp8 unpack + dot2 (2 MACs)", fp8_dot2_throughput, 32);
+    ReportKernel("fp8 -> fp16 convert (2 values)", fp8_convert_throughput, 32);
+
     std::printf("\n-- wave scaling (v_fma_f32 issue rate) --\n");
     std::printf("%-34s %7.2f cycles\n", "1 wave", Measure(throughput_kernel<FmaStep>, 200000, 32, 32));
     std::printf("%-34s %7.2f cycles\n", "2 waves", Measure(throughput_kernel<FmaStep>, 200000, 32, 64));
@@ -844,6 +903,9 @@ int main() {
     CalibrateClock();
     return 0;
 }
+
+
+
 
 
 
