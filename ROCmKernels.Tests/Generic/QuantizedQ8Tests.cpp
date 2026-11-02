@@ -223,4 +223,8 @@ TEST_CASE("Q8_0 rejects invalid shapes", "[generic][quantized]") {
     CHECK(dequantize_q8_0(blocks, values, 0, nullptr) == hipErrorInvalidValue);
     CHECK(quantized_gemv_q8_0(blocks, blocks, nullptr, values, 1, 33, DType::Float32, nullptr) == hipErrorInvalidValue);
     CHECK(quantized_gemv_q8_0(blocks, blocks, nullptr, values, 0, 32, DType::Float32, nullptr) == hipErrorInvalidValue);
+
+    constexpr long long kTooManyElements = 1LL << 40;
+    CHECK(quantize_q8_0(values, blocks, kTooManyElements, nullptr) == hipErrorInvalidValue);
+    CHECK(dequantize_q8_0(blocks, values, kTooManyElements, nullptr) == hipErrorInvalidValue);
 }

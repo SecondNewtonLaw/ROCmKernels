@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 
 namespace {
     using ROCmKernels::Kernels::BlockQ8_0;
@@ -94,12 +95,16 @@ namespace {
 
     int launch_quantize(const float *input, BlockQ8_0 *output, const long long elements, const hipStream_t stream) {
         const long long blocks = elements / kQ8Block;
+        if (blocks > static_cast<long long>(std::numeric_limits<unsigned int>::max()) * kWarpsPerBlock) return hipErrorInvalidValue;
+
         const unsigned int grid = static_cast<unsigned int>((blocks + kWarpsPerBlock - 1) / kWarpsPerBlock);
         hipLaunchKernelGGL((quantize_q8_0_kernel), dim3(grid), dim3(kThreads), 0, stream, input, output, blocks);
         return hipGetLastError();
     }
 
     int launch_dequantize(const BlockQ8_0 *input, float *output, const long long elements, const hipStream_t stream) {
+        if (elements > static_cast<long long>(std::numeric_limits<unsigned int>::max()) * kDequantizeThreads) return hipErrorInvalidValue;
+
         const unsigned int grid = static_cast<unsigned int>((elements + kDequantizeThreads - 1) / kDequantizeThreads);
         hipLaunchKernelGGL((dequantize_q8_0_kernel), dim3(grid), dim3(kDequantizeThreads), 0, stream, input, output, elements);
         return hipGetLastError();
