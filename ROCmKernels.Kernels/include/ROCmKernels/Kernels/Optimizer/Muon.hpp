@@ -7,6 +7,8 @@
 #include <hip/hip_runtime.h>
 
 extern "C" ROCMKERNELS_EXPORT int muon_fp32_supported(int rows, int columns);
+extern "C" ROCMKERNELS_EXPORT int muon_fp32_gram_split(const float *y, const float *gin, float *g, float *partials, const float *sumsq, int count,
+        int m, int n, float alpha, float beta, float diag, int mode, int splits, hipStream_t stream);
 extern "C" ROCMKERNELS_EXPORT int muon_fp32_make_b(const float *a, const float *a2, float *b, int count, int n, float c3, float c4, float c5,
         hipStream_t stream);
 extern "C" ROCMKERNELS_EXPORT int muon_fp32_prepare(const std::int64_t *gradients, const std::int64_t *buffers, float *y, int *flags, float *sumsq,
@@ -21,6 +23,13 @@ extern "C" ROCMKERNELS_EXPORT int muon_fp32_apply(const float *y, const float *b
 namespace ROCmKernels::Kernels {
     /// True when both dimensions are multiples of 128, which every Muon kernel requires.
     inline bool MuonSupported(const int rows, const int columns) { return muon_fp32_supported(rows, columns) != 0; }
+
+    /// Split-K gram. partials holds count * splits * (n / 128)^2 * 128 * 128 floats and is reduced in
+    /// a fixed order, so the result is deterministic. splits == 1 falls back to MuonGram.
+    inline void MuonGramSplit(const float *y, const float *gin, float *g, float *partials, const float *sumsq, const int count, const int m,
+            const int n, const float alpha, const float beta, const float diag, const bool scaled, const int splits, hipStream_t stream = nullptr) {
+        ROCMKERNELS_HIP_CHECK(muon_fp32_gram_split(y, gin, g, partials, sumsq, count, m, n, alpha, beta, diag, scaled ? 1 : 0, splits, stream));
+    }
 
     /// B = c3 * I + c4 * a + c5 * a^2 for count n x n matrices, the Newton-Schulz quintic denominator.
     inline void MuonMakeB(const float *a, const float *a2, float *b, const int count, const int n, const float c3, const float c4, const float c5,
@@ -56,4 +65,5 @@ namespace ROCmKernels::Kernels {
                 stream));
     }
 } // namespace ROCmKernels::Kernels
+
 

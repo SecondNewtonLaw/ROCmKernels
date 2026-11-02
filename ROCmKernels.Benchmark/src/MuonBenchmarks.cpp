@@ -35,6 +35,8 @@ namespace {
             this->gram.Resize(innerElements * this->count);
             this->out.Resize(matrixElements * this->count);
             this->a2.Resize(innerElements * this->count);
+            const int side = this->n / 128;
+            this->partials.Resize(static_cast<std::size_t>(this->count) * 8 * side * side * 128 * 128);
             this->identity.Resize(innerElements * this->count);
             std::vector<float> hostIdentity(innerElements * this->count, 0.0f);
             for (int matrix = 0; matrix < this->count; ++matrix)
@@ -90,6 +92,7 @@ namespace {
         ROCmKernels::DeviceBuffer<float> gram;
         ROCmKernels::DeviceBuffer<float> out;
         ROCmKernels::DeviceBuffer<float> a2;
+        ROCmKernels::DeviceBuffer<float> partials;
         ROCmKernels::DeviceBuffer<float> identity;
     };
 
@@ -179,8 +182,8 @@ namespace {
                             s.count, s.m, s.n, 0.95f, stream);
                     for (int iteration = 0; iteration < 5; ++iteration) {
                         const bool scaled = iteration == 0;
-                        ROCmKernels::Kernels::MuonGram(s.y.Data(), nullptr, s.gram.Data(), s.sumsq.Data(), s.count, s.m, s.n, 1.0f, 0.0f, 0.0f,
-                                scaled, stream);
+                        ROCmKernels::Kernels::MuonGramSplit(s.y.Data(), nullptr, s.gram.Data(), s.partials.Data(), s.sumsq.Data(), s.count, s.m, s.n,
+                                1.0f, 0.0f, 0.0f, scaled, s.m >= 1024 ? 8 : 1, stream);
                         ROCmKernels::Kernels::MuonMultiply(s.gram.Data(), s.gram.Data(), s.a2.Data(), s.sumsq.Data(), s.count, s.n, s.n, false, stream);
                         ROCmKernels::Kernels::MuonMakeB(s.gram.Data(), s.a2.Data(), s.b.Data(), s.count, s.n, 3.4445f, -4.7750f, 2.0315f, stream);
                         ROCmKernels::Kernels::MuonMultiply(s.y.Data(), s.b.Data(), s.y.Data(), s.sumsq.Data(), s.count, s.m, s.n, scaled, stream);
@@ -207,6 +210,8 @@ namespace {
 
     [[maybe_unused]] const Registrar kRegistrar;
 } // namespace
+
+
 
 
 

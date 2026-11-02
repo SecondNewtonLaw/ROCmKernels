@@ -214,6 +214,104 @@ static __global__ void gemm_kernel(const float* A, const float* B, float* C, con
     }
 }
 
+// Split-K gram: each block computes one 128x128 upper tile over a slice of the K
+// axis and writes the unscaled partial. A separate reduce sums the splits in a
+// fixed order, so the result is bit-reproducible.
+static __global__ void gram_split_kernel(const float* A, float* partials, int m, int n, int splits) {
+    const int bj = blockIdx.x, bi = blockIdx.y;
+    if (bj < bi) return;
+    const int matrix = blockIdx.z / splits, split = blockIdx.z % splits;
+    const int side = n / TILE;
+    const int64_t tile = static_cast<int64_t>(bi) * side + bj;
+    const int64_t stride = static_cast<int64_t>(side) * side * TILE * TILE;
+    float* out = partials + (static_cast<int64_t>(matrix) * splits + split) * stride + tile * TILE * TILE;
+    A += static_cast<int64_t>(matrix) * m * n;
+
+    constexpr int LEFT = TILE;
+    __shared__ __attribute__((aligned(16))) float left[KSTEP][LEFT], right[KSTEP][TILE];
+    const int t = threadIdx.x, tx = t % 16, ty = t / 16;
+    const int kr = t / 32, c4 = t % 32;
+    float acc[8][8] = {};
+    const int k0 = static_cast<int>(static_cast<int64_t>(m) * split / splits);
+    const int k1 = static_cast<int>(static_cast<int64_t>(m) * (split + 1) / splits);
+    constexpr int LOADS = KSTEP / 8;
+    float4 la[LOADS], lb[LOADS];
+
+    auto fetch = [&](int kk) {
+#pragma unroll
+        for (int s = 0; s < LOADS; ++s) {
+            la[s] = *reinterpret_cast<const float4*>(A + static_cast<int64_t>(kk + s * 8 + kr) * n + bi * TILE + c4 * 4);
+            lb[s] = *reinterpret_cast<const float4*>(A + static_cast<int64_t>(kk + s * 8 + kr) * n + bj * TILE + c4 * 4);
+        }
+    };
+    fetch(k0);
+    for (int kk0 = k0; kk0 < k1; kk0 += KSTEP) {
+#pragma unroll
+        for (int s = 0; s < LOADS; ++s) {
+            *reinterpret_cast<float4*>(&left[s * 8 + kr][c4 * 4]) = la[s];
+            *reinterpret_cast<float4*>(&right[s * 8 + kr][c4 * 4]) = lb[s];
+        }
+        __syncthreads();
+        if (kk0 + KSTEP < k1) fetch(kk0 + KSTEP);
+#pragma unroll
+        for (int kk = 0; kk < KSTEP; ++kk) {
+            const float4 a0 = *reinterpret_cast<const float4*>(&left[kk][ty * 4]);
+            const float4 a1 = *reinterpret_cast<const float4*>(&left[kk][ty * 4 + 64]);
+            const float4 b0 = *reinterpret_cast<const float4*>(&right[kk][tx * 4]);
+            const float4 b1 = *reinterpret_cast<const float4*>(&right[kk][tx * 4 + 64]);
+            const float av[8] = {a0.x, a0.y, a0.z, a0.w, a1.x, a1.y, a1.z, a1.w};
+            const float bv[8] = {b0.x, b0.y, b0.z, b0.w, b1.x, b1.y, b1.z, b1.w};
+#pragma unroll
+            for (int i = 0; i < 8; ++i)
+#pragma unroll
+                for (int j = 0; j < 8; ++j) acc[i][j] = fmaf(av[i], bv[j], acc[i][j]);
+        }
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (int h = 0; h < 2; ++h) {
+#pragma unroll
+        for (int w = 0; w < 2; ++w) {
+            const int lrow = ty * 4 + h * 64, lcol = tx * 4 + w * 64;
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const float4 v = make_float4(acc[h * 4 + i][w * 4 + 0], acc[h * 4 + i][w * 4 + 1], acc[h * 4 + i][w * 4 + 2], acc[h * 4 + i][w * 4 + 3]);
+                *reinterpret_cast<float4*>(out + static_cast<int64_t>(lrow + i) * TILE + lcol) = v;
+            }
+        }
+    }
+}
+
+static __global__ void gram_reduce_kernel(const float* partials, const float* gin, float* C, const float* sumsq, int n, int splits,
+                                          float alpha, float beta, float diag, int mode, int mirror) {
+    const int matrix = blockIdx.y;
+    const int side = n / TILE;
+    const int64_t stride = static_cast<int64_t>(side) * side * TILE * TILE;
+    const float s = mode ? 1.0f / (sqrtf(sumsq[matrix]) + 1e-7f) : 1.0f;
+    const float scale = alpha * (mode ? s * s : 1.0f);
+    const float* base = partials + static_cast<int64_t>(matrix) * splits * stride;
+    float* out = C + static_cast<int64_t>(matrix) * n * n;
+    const float* add = gin ? gin + static_cast<int64_t>(matrix) * n * n : nullptr;
+
+    const int64_t total = static_cast<int64_t>(n) * n;
+    for (int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; index < total;
+         index += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+        const int row = static_cast<int>(index) / n, column = static_cast<int>(index) % n;
+        if (mirror && row > column) continue;
+        const int bi = row / TILE, bj = column / TILE;
+        const int64_t tile = static_cast<int64_t>(bi) * side + bj;
+        const int64_t inner = static_cast<int64_t>(row % TILE) * TILE + column % TILE;
+        float sum = 0.0f;
+        for (int split = 0; split < splits; ++split) sum += base[static_cast<int64_t>(split) * stride + tile * TILE * TILE + inner];
+        float value = scale * sum;
+        if (add) value += beta * add[index];
+        if (row == column) value += diag;
+        out[index] = value;
+        if (mirror && row != column) out[static_cast<int64_t>(column) * n + row] = value;
+    }
+}
+
 // B = c3 * I + c4 * a + c5 * a^2, the Newton-Schulz quintic denominator.
 // Building B elementwise removes the second y^T y of every iteration.
 static __global__ void make_b_kernel(const float* a, const float* a2, float* b, int n, float c3, float c4, float c5) {
@@ -227,6 +325,20 @@ static __global__ void make_b_kernel(const float* a, const float* a2, float* b, 
         if (row == column) value += c3;
         b[base + index] = value;
     }
+}
+
+extern "C" ROCMKERNELS_EXPORT int muon_fp32_gram_split(const float* y, const float* gin, float* g, float* partials, const float* sumsq, int count,
+                                           int m, int n, float alpha, float beta, float diag, int mode, int splits, hipStream_t stream) {
+    if (count < 1 || n % TILE || (m % KSTEP) || splits < 1) return hipErrorInvalidValue;
+    if (splits == 1) return muon_fp32_gram(y, gin, g, sumsq, count, m, n, alpha, beta, diag, mode, stream);
+    const int side = n / TILE;
+    hipLaunchKernelGGL(gram_split_kernel, dim3(side, side, count * splits), dim3(256), 0, stream, y, partials, m, n, splits);
+    hipError_t status = hipGetLastError();
+    if (status != hipSuccess) return status;
+    const int blocks = static_cast<int>((static_cast<int64_t>(n) * n + 255) / 256 < 64 ? (static_cast<int64_t>(n) * n + 255) / 256 : 64);
+    hipLaunchKernelGGL(gram_reduce_kernel, dim3(blocks, count), dim3(256), 0, stream, partials, gin, g, sumsq, n, splits, alpha, beta, diag,
+                       mode, gin == nullptr);
+    return hipGetLastError();
 }
 
 extern "C" ROCMKERNELS_EXPORT int muon_fp32_make_b(const float* a, const float* a2, float* b, int count, int n, float c3, float c4, float c5,
@@ -285,6 +397,9 @@ extern "C" ROCMKERNELS_EXPORT int muon_fp32_apply(const float* y, const float* b
                        0.0f, 0.0f, mode, 0.0f, params, flags, decay_factor, step, transposed);
     return hipGetLastError();
 }
+
+
+
 
 
 
