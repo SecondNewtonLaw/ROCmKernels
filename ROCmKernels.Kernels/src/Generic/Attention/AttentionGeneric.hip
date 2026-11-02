@@ -128,6 +128,114 @@ namespace {
         }
     }
 
+    __device__ __forceinline__ unsigned Pack(const __half low, const __half high) {
+        return __builtin_bit_cast(unsigned, __halves2half2(low, high));
+    }
+
+    __device__ __forceinline__ float Dot2(const unsigned a, const unsigned b, const float accumulator) {
+        float result = accumulator;
+        asm("v_dot2_f32_f16 %0, %1, %2, %0" : "+v"(result) : "v"(a), "v"(b));
+        return result;
+    }
+
+    /// fp16 variant of attention_generic_query: K holds feature pairs and V holds key pairs, so both
+    /// products run as v_dot2_f32_f16 with fp32 accumulation.
+    template<int HEAD_WIDTH>
+    __global__ void attention_generic_query_half(const __half *q, const __half *k, const __half *v, const bool *mask, __half *output,
+            float *lse, const int heads, const int queries, const int keys, const int radius, const Strides qs, const Strides ks,
+            const Strides vs, const Strides os, const float scale) {
+        constexpr int kPairs = HEAD_WIDTH / 2;
+        __shared__ unsigned sharedK[kKeyTile][kPairs + 1];
+        __shared__ unsigned sharedV[kKeyTile / 2][HEAD_WIDTH];
+
+        const int lane = threadIdx.x % 32;
+        const int warp = threadIdx.x / 32;
+        const int query = blockIdx.x * kWarps + warp;
+        const int head = blockIdx.y;
+        const int batch = blockIdx.z;
+        const bool validQuery = query < queries;
+
+        const __half *queryBase = q + batch * qs.batch + head * qs.head;
+        const __half *keyBase = k + batch * ks.batch + head * ks.head;
+        const __half *valueBase = v + batch * vs.batch + head * vs.head;
+        __half *outputBase = output + batch * os.batch + head * os.head;
+        const bool *maskBase = mask + batch * keys;
+        const __half zero = __float2half_rn(0.0f);
+
+        unsigned queryPair = 0;
+        if (validQuery && lane < kPairs) {
+            const __half *row = queryBase + query * qs.token + 2 * lane;
+            queryPair = Pack(row[0], row[1]);
+        }
+
+        const int blockFirst = blockIdx.x * kWarps;
+        const int first = radius < 0 ? 0 : max(0, blockFirst - radius);
+        const int last = radius < 0 ? keys : min(keys, blockFirst + kWarps + radius);
+        const int queryFirst = radius < 0 ? 0 : max(0, query - radius);
+        const int queryLast = radius < 0 ? keys : min(keys, query + radius + 1);
+
+        float maximum = -INFINITY;
+        float total = 0.0f;
+        float accumulator0 = 0.0f;
+        float accumulator1 = 0.0f;
+
+        for (int start = first; start < last; start += kKeyTile) {
+            for (int index = threadIdx.x; index < kKeyTile * kPairs; index += kWarps * 32) {
+                const int row = index / kPairs;
+                const int pair = index % kPairs;
+                const int key = start + row;
+                const __half *source = keyBase + key * ks.token + 2 * pair;
+                sharedK[row][pair] = key < last && maskBase[key] ? Pack(source[0], source[1]) : 0u;
+            }
+            for (int index = threadIdx.x; index < kKeyTile / 2 * HEAD_WIDTH; index += kWarps * 32) {
+                const int row = index / HEAD_WIDTH;
+                const int column = index % HEAD_WIDTH;
+                const int key = start + 2 * row;
+                const __half low = key < last && maskBase[key] ? valueBase[key * vs.token + column] : zero;
+                const __half high = key + 1 < last && maskBase[key + 1] ? valueBase[(key + 1) * vs.token + column] : zero;
+                sharedV[row][column] = Pack(low, high);
+            }
+            __syncthreads();
+
+            if (start < queryLast && start + kKeyTile > queryFirst) {
+                float score = 0.0f;
+                #pragma unroll
+                for (int pair = 0; pair < kPairs; ++pair)
+                    score = Dot2(__builtin_amdgcn_readlane(queryPair, pair), sharedK[lane][pair], score);
+
+                const int key = start + lane;
+                const bool active = validQuery && key < last && maskBase[key] && (radius < 0 || abs(query - key) <= radius);
+                score = active ? score * scale : -INFINITY;
+
+                const float next = fmaxf(maximum, WaveMaximum(score));
+                const float old = isfinite(maximum) ? __expf(maximum - next) : 0.0f;
+                const float weight = active ? __expf(score - next) : 0.0f;
+                total = total * old + WaveTotal(weight);
+                accumulator0 *= old;
+                accumulator1 *= old;
+                #pragma unroll
+                for (int row = 0; row < kKeyTile / 2; ++row) {
+                    const unsigned probability = Pack(__float2half_rn(Broadcast(weight, 2 * row)), __float2half_rn(Broadcast(weight, 2 * row + 1)));
+                    accumulator0 = Dot2(probability, lane < HEAD_WIDTH ? sharedV[row][lane] : 0u, accumulator0);
+                    if constexpr (HEAD_WIDTH == 64) accumulator1 = Dot2(probability, sharedV[row][lane + 32], accumulator1);
+                }
+                maximum = next;
+            }
+            __syncthreads();
+        }
+
+        if (validQuery) {
+            __half *destination = outputBase + query * os.token;
+            if (lane < HEAD_WIDTH) StoreScalar(destination + lane, total > 0 ? accumulator0 / total : 0.0f);
+            if constexpr (HEAD_WIDTH == 64) StoreScalar(destination + lane + 32, total > 0 ? accumulator1 / total : 0.0f);
+            if (lane == 0) {
+                const int row = (batch * heads + head) * queries + query;
+                lse[row * 2] = total > 0 ? maximum : -INFINITY;
+                lse[row * 2 + 1] = total > 0 ? total : 0.0f;
+            }
+        }
+    }
+
     template<typename T>
     hipError_t launch(const void *q, const void *k, const void *v, const bool *mask, void *output, float *lse, const int batch,
             const int heads, const int queries, const int keys, const int headWidth, const int radius, const Strides &qs, const Strides &ks,
@@ -140,6 +248,26 @@ namespace {
         const T *typedK = static_cast<const T *>(k);
         const T *typedV = static_cast<const T *>(v);
         T *typedOutput = static_cast<T *>(output);
+
+        if constexpr (std::is_same_v<T, __half>) {
+            switch (headWidth) {
+                case 16:
+                    hipLaunchKernelGGL((attention_generic_query_half<16>), grid, block, 0, stream, typedQ, typedK, typedV, mask, typedOutput, lse,
+                            heads, queries, keys, radius, qs, ks, vs, os, scale);
+                    break;
+                case 32:
+                    hipLaunchKernelGGL((attention_generic_query_half<32>), grid, block, 0, stream, typedQ, typedK, typedV, mask, typedOutput, lse,
+                            heads, queries, keys, radius, qs, ks, vs, os, scale);
+                    break;
+                case 64:
+                    hipLaunchKernelGGL((attention_generic_query_half<64>), grid, block, 0, stream, typedQ, typedK, typedV, mask, typedOutput, lse,
+                            heads, queries, keys, radius, qs, ks, vs, os, scale);
+                    break;
+                default:
+                    return hipErrorInvalidValue;
+            }
+            return hipGetLastError();
+        }
 
         switch (headWidth) {
             case 16:
