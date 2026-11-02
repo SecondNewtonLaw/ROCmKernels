@@ -6,38 +6,77 @@
 #include <cmath>
 
 namespace {
-    constexpr int kThreads = 128;
+    constexpr int kThreads = 256;
 
+    // One block per token covers every head, so each angle's sincos is computed once instead of once per head.
     template<typename T, bool NeoX>
-    __global__ void rope_forward_kernel(const T *input, T *output, const int *positions, const int headDim, const int rotaryDim,
-            const float thetaScale, const int tokens, const ROCmKernels::Kernels::Strides is, const ROCmKernels::Kernels::Strides os) {
+    __global__ void rope_forward_kernel(const T *input, T *output, const int *positions, const int heads, const int headDim,
+            const int rotaryDim, const float thetaScale, const int tokens, const ROCmKernels::Kernels::Strides is,
+            const ROCmKernels::Kernels::Strides os) {
+        extern __shared__ float2 rotation[];
+
         const int token = blockIdx.x;
-        const int head = blockIdx.y;
-        const int sample = blockIdx.z;
-        const int inputBase = sample * is.batch + head * is.head + token * is.token;
-        const int outputBase = sample * os.batch + head * os.head + token * os.token;
+        const int sample = blockIdx.y;
         const int half = rotaryDim / 2;
         const int position = positions[sample * tokens + token];
 
         for (int index = threadIdx.x; index < half; index += blockDim.x) {
+            const float angle = static_cast<float>(position) * powf(thetaScale, static_cast<float>(index));
+            float2 value;
+            sincosf(angle, &value.y, &value.x);
+            rotation[index] = value;
+        }
+        __syncthreads();
+
+        // Two adjacent angles per thread so every access is a pair; needs even offsets for the pair alignment.
+        const bool paired = half % 2 == 0 && (is.batch | is.head | is.token | os.batch | os.head | os.token) % 2 == 0;
+        if (paired) {
+            const int quarter = half / 2;
+            for (int item = threadIdx.x; item < heads * quarter; item += blockDim.x) {
+                const int head = item / quarter;
+                const int index = 2 * (item - head * quarter);
+                const int inputBase = sample * is.batch + head * is.head + token * is.token;
+                const int outputBase = sample * os.batch + head * os.head + token * os.token;
+                const int first = NeoX ? index : 2 * index;
+                const int second = NeoX ? index + half : 2 * index + 2;
+
+                const float2 a = ROCmKernels::Kernels::LoadPair(input + inputBase + first);
+                const float2 b = ROCmKernels::Kernels::LoadPair(input + inputBase + second);
+                const float2 r0 = rotation[index];
+                const float2 r1 = rotation[index + 1];
+                // NeoX pairs hold (x0[i], x0[i+1]) and (x1[i], x1[i+1]); normal pairs hold (x0[i], x1[i]) and (x0[i+1], x1[i+1]).
+                const float2 x0 = NeoX ? a : make_float2(a.x, b.x);
+                const float2 x1 = NeoX ? b : make_float2(a.y, b.y);
+                const float2 y0 = make_float2(x0.x * r0.x - x1.x * r0.y, x0.y * r1.x - x1.y * r1.y);
+                const float2 y1 = make_float2(x0.x * r0.y + x1.x * r0.x, x0.y * r1.y + x1.y * r1.x);
+                ROCmKernels::Kernels::StorePair(output + outputBase + first, NeoX ? y0 : make_float2(y0.x, y1.x));
+                ROCmKernels::Kernels::StorePair(output + outputBase + second, NeoX ? y1 : make_float2(y0.y, y1.y));
+            }
+        }
+
+        for (int item = threadIdx.x; !paired && item < heads * half; item += blockDim.x) {
+            const int head = item / half;
+            const int index = item - head * half;
+            const int inputBase = sample * is.batch + head * is.head + token * is.token;
+            const int outputBase = sample * os.batch + head * os.head + token * os.token;
             const int low = NeoX ? index : 2 * index;
             const int high = NeoX ? index + half : 2 * index + 1;
 
             // Both values are read before either store, so an aliased output stays correct.
             const float x0 = ROCmKernels::Kernels::LoadScalar(input + inputBase + low);
             const float x1 = ROCmKernels::Kernels::LoadScalar(input + inputBase + high);
+            const float2 r = rotation[index];
 
-            const float angle = static_cast<float>(position) * powf(thetaScale, static_cast<float>(index));
-            float sine;
-            float cosine;
-            sincosf(angle, &sine, &cosine);
-
-            ROCmKernels::Kernels::StoreScalar(output + outputBase + low, x0 * cosine - x1 * sine);
-            ROCmKernels::Kernels::StoreScalar(output + outputBase + high, x0 * sine + x1 * cosine);
+            ROCmKernels::Kernels::StoreScalar(output + outputBase + low, x0 * r.x - x1 * r.y);
+            ROCmKernels::Kernels::StoreScalar(output + outputBase + high, x0 * r.y + x1 * r.x);
         }
 
-        for (int index = rotaryDim + threadIdx.x; index < headDim; index += blockDim.x) {
-            ROCmKernels::Kernels::StoreScalar(output + outputBase + index, ROCmKernels::Kernels::LoadScalar(input + inputBase + index));
+        const int tail = headDim - rotaryDim;
+        for (int item = threadIdx.x; item < heads * tail; item += blockDim.x) {
+            const int head = item / tail;
+            const int index = rotaryDim + item - head * tail;
+            ROCmKernels::Kernels::StoreScalar(output + sample * os.batch + head * os.head + token * os.token + index,
+                    ROCmKernels::Kernels::LoadScalar(input + sample * is.batch + head * is.head + token * is.token + index));
         }
     }
 
@@ -47,15 +86,16 @@ namespace {
             const ROCmKernels::Kernels::Strides os, const hipStream_t stream) {
         // theta^(-2i/rotaryDim) is raised to i in the kernel.
         const float thetaScale = rotaryDim > 0 ? std::pow(theta, -2.0f / static_cast<float>(rotaryDim)) : 1.0f;
-        const dim3 grid(tokens, heads, batch);
+        const dim3 grid(tokens, batch);
         const dim3 block(kThreads);
+        const std::size_t shared = static_cast<std::size_t>(rotaryDim / 2) * sizeof(float2);
 
         if (style == ROCmKernels::Kernels::RopeStyle::NeoX) {
-            hipLaunchKernelGGL((rope_forward_kernel<T, true>), grid, block, 0, stream, static_cast<const T *>(input), static_cast<T *>(output),
-                    positions, headDim, rotaryDim, thetaScale, tokens, is, os);
+            hipLaunchKernelGGL((rope_forward_kernel<T, true>), grid, block, shared, stream, static_cast<const T *>(input),
+                    static_cast<T *>(output), positions, heads, headDim, rotaryDim, thetaScale, tokens, is, os);
         } else {
-            hipLaunchKernelGGL((rope_forward_kernel<T, false>), grid, block, 0, stream, static_cast<const T *>(input), static_cast<T *>(output),
-                    positions, headDim, rotaryDim, thetaScale, tokens, is, os);
+            hipLaunchKernelGGL((rope_forward_kernel<T, false>), grid, block, shared, stream, static_cast<const T *>(input),
+                    static_cast<T *>(output), positions, heads, headDim, rotaryDim, thetaScale, tokens, is, os);
         }
 
         return hipGetLastError();
