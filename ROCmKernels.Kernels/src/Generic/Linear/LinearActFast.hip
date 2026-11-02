@@ -29,8 +29,6 @@ namespace {
 
     // The fp16 path keeps K contiguous so one LDS delivers a half2 pair and one
     // instruction performs two MACs. RDNA2 has v_dot2_f32_f16 and no MFMA.
-    // A 32-wide K tile halves the barrier count per block compared with 16.
-    constexpr int kHalfKTile = 32;
 
 
     __device__ __forceinline__ float dot2(const __half2 a, const __half2 b, const float accumulator) {
@@ -415,15 +413,159 @@ namespace {
         }
     }
 
+    // Wide fp16 tiles. Both keep 32 outputs per thread and 256 threads:
+    //   Columns > 128: 128 rows x 64 columns, 8x4 per thread.
+    //   Columns <= 128: 64 rows x 128 columns, 4x8 per thread, so the whole
+    //   output width is covered by one block and A is read once.
+    // rocBLAS uses 128x128x16 and 128x256x16 Tensile tiles for these shapes.
+    template<int Rows, int KTile, int Pitch>
+    __device__ __forceinline__ void load_a_half_wide(const __half *input, __half (*tile)[Pitch], const int rowBase, const int kBase,
+            const int rows, const int inner, const bool vectorized, const int tid) {
+        constexpr int kElements = 8;
+        constexpr int kVectorsPerRow = KTile / kElements;
+
+        if (vectorized) {
+            for (int index = tid; index < Rows * kVectorsPerRow; index += kThreads) {
+                const int row = index / kVectorsPerRow;
+                const int kOffset = (index % kVectorsPerRow) * kElements;
+                const int globalRow = rowBase + row;
+                if (globalRow < rows && kBase + kOffset < inner) {
+                    const uint4 value = *reinterpret_cast<const uint4 *>(input + static_cast<std::size_t>(globalRow) * inner + kBase + kOffset);
+                    const __half *values = reinterpret_cast<const __half *>(&value);
+                    #pragma unroll
+                    for (int element = 0; element < kElements; ++element) tile[row][kOffset + element] = values[element];
+                } else {
+                    #pragma unroll
+                    for (int element = 0; element < kElements; ++element) tile[row][kOffset + element] = __float2half_rn(0.0f);
+                }
+            }
+            return;
+        }
+
+        for (int index = tid; index < Rows * KTile; index += kThreads) {
+            const int row = index / KTile;
+            const int kOffset = index % KTile;
+            const int globalRow = rowBase + row;
+            const int k = kBase + kOffset;
+            tile[row][kOffset] = globalRow < rows && k < inner
+                    ? input[static_cast<std::size_t>(globalRow) * inner + k]
+                    : __float2half_rn(0.0f);
+        }
+    }
+
+    template<int Columns, int KTile, int Pitch>
+    __device__ __forceinline__ void load_b_half_wide(const __half *weight, __half (*tile)[Pitch], const int columnBase, const int kBase,
+            const int columns, const int inner, const bool vectorized, const int tid) {
+        constexpr int kElements = 8;
+        constexpr int kVectorsPerRow = Columns / kElements;
+
+        if (vectorized) {
+            for (int index = tid; index < KTile * kVectorsPerRow; index += kThreads) {
+                const int kOffset = index / kVectorsPerRow;
+                const int column = (index % kVectorsPerRow) * kElements;
+                const int k = kBase + kOffset;
+                const int globalColumn = columnBase + column;
+                if (k < inner && globalColumn < columns) {
+                    const uint4 value = *reinterpret_cast<const uint4 *>(weight + static_cast<std::size_t>(k) * columns + globalColumn);
+                    const __half *values = reinterpret_cast<const __half *>(&value);
+                    #pragma unroll
+                    for (int element = 0; element < kElements; ++element) tile[column + element][kOffset] = values[element];
+                } else {
+                    #pragma unroll
+                    for (int element = 0; element < kElements; ++element) tile[column + element][kOffset] = __float2half_rn(0.0f);
+                }
+            }
+            return;
+        }
+
+        for (int index = tid; index < KTile * Columns; index += kThreads) {
+            const int kOffset = index / Columns;
+            const int column = index % Columns;
+            const int k = kBase + kOffset;
+            const int globalColumn = columnBase + column;
+            tile[column][kOffset] = k < inner && globalColumn < columns
+                    ? weight[static_cast<std::size_t>(k) * columns + globalColumn]
+                    : __float2half_rn(0.0f);
+        }
+    }
+
+    template<int Rows, int Columns, int TileRows, int TileColumns, int KTile, bool Activate>
+    __global__ __launch_bounds__(kThreads) void linear_act_fast_half_wide_kernel(const __half *input, const __half *weight, const __half *bias,
+            __half *output, const int rows, const int columns, const int inner) {
+        __shared__ __half tileA[Rows][KTile + 2];
+        __shared__ __half tileB[Columns][KTile + 2];
+
+        const int tid = threadIdx.y * kThreadsX + threadIdx.x;
+        const int rowBase = blockIdx.y * Rows;
+        const int columnBase = blockIdx.x * Columns;
+        const bool vectorizedA = Vectorizable(input, inner);
+        const bool vectorizedB = Vectorizable(weight, columns);
+
+        float accumulators[TileRows][TileColumns] = {};
+
+        for (int kBase = 0; kBase < inner; kBase += KTile) {
+            load_a_half_wide<Rows, KTile, KTile + 2>(input, tileA, rowBase, kBase, rows, inner, vectorizedA, tid);
+            load_b_half_wide<Columns, KTile, KTile + 2>(weight, tileB, columnBase, kBase, columns, inner, vectorizedB, tid);
+            __syncthreads();
+
+            #pragma unroll
+            for (int k = 0; k < KTile; k += 2) {
+                __half2 a[TileRows];
+                __half2 b[TileColumns];
+                #pragma unroll
+                for (int i = 0; i < TileRows; ++i) a[i] = *reinterpret_cast<const __half2 *>(&tileA[threadIdx.y + i * kThreadsY][k]);
+                #pragma unroll
+                for (int j = 0; j < TileColumns; ++j) b[j] = *reinterpret_cast<const __half2 *>(&tileB[threadIdx.x + j * kThreadsX][k]);
+                #pragma unroll
+                for (int i = 0; i < TileRows; ++i) {
+                    #pragma unroll
+                    for (int j = 0; j < TileColumns; ++j) accumulators[i][j] = dot2(a[i], b[j], accumulators[i][j]);
+                }
+            }
+            __syncthreads();
+        }
+
+        float biasValues[TileColumns];
+        #pragma unroll
+        for (int j = 0; j < TileColumns; ++j) {
+            const int column = columnBase + threadIdx.x + j * kThreadsX;
+            biasValues[j] = bias != nullptr && column < columns ? __half2float(bias[column]) : 0.0f;
+        }
+
+        #pragma unroll
+        for (int i = 0; i < TileRows; ++i) {
+            const int row = rowBase + threadIdx.y + i * kThreadsY;
+            if (row >= rows) continue;
+            #pragma unroll
+            for (int j = 0; j < TileColumns; ++j) {
+                const int column = columnBase + threadIdx.x + j * kThreadsX;
+                if (column >= columns) continue;
+                const float value = accumulators[i][j] + biasValues[j];
+                output[static_cast<std::size_t>(row) * columns + column] = __float2half_rn(Activate ? silu(value) : value);
+            }
+        }
+    }
     template<typename T, bool Activate, bool Transposed>
     int launch_linear(const void *input, const void *weight, const void *bias, void *output, const int rows, const int columns, const int inner,
             const hipStream_t stream) {
-        const dim3 grid((columns + kBlockColumns - 1) / kBlockColumns, (rows + kBlockRows - 1) / kBlockRows);
-        if constexpr (std::is_same_v<T, __half>) {
-            hipLaunchKernelGGL((linear_act_fast_half_kernel<Transposed ? 16 : kHalfKTile, Activate, Transposed>), grid, dim3(kThreadsX, kThreadsY), 0, stream,
+        if constexpr (std::is_same_v<T, __half> && !Transposed) {
+            if (columns > 128) {
+                const dim3 grid((columns + 63) / 64, (rows + 127) / 128);
+                hipLaunchKernelGGL((linear_act_fast_half_wide_kernel<128, 64, 8, 4, 64, Activate>), grid, dim3(kThreadsX, kThreadsY), 0, stream,
+                        static_cast<const __half *>(input), static_cast<const __half *>(weight), static_cast<const __half *>(bias),
+                        static_cast<__half *>(output), rows, columns, inner);
+            } else {
+                const dim3 grid((columns + 127) / 128, (rows + 63) / 64);
+                hipLaunchKernelGGL((linear_act_fast_half_wide_kernel<64, 128, 4, 8, 32, Activate>), grid, dim3(kThreadsX, kThreadsY), 0, stream,
+                        static_cast<const __half *>(input), static_cast<const __half *>(weight), static_cast<const __half *>(bias),
+                        static_cast<__half *>(output), rows, columns, inner);
+            }        } else if constexpr (std::is_same_v<T, __half>) {
+            const dim3 grid((columns + kBlockColumns - 1) / kBlockColumns, (rows + kBlockRows - 1) / kBlockRows);
+            hipLaunchKernelGGL((linear_act_fast_half_kernel<16, Activate, true>), grid, dim3(kThreadsX, kThreadsY), 0, stream,
                     static_cast<const __half *>(input), static_cast<const __half *>(weight), static_cast<const __half *>(bias),
                     static_cast<__half *>(output), rows, columns, inner);
         } else {
+            const dim3 grid((columns + kBlockColumns - 1) / kBlockColumns, (rows + kBlockRows - 1) / kBlockRows);
             hipLaunchKernelGGL((linear_act_fast_kernel<T, Activate, Transposed>), grid, dim3(kThreadsX, kThreadsY), 0, stream,
                     static_cast<const T *>(input), static_cast<const T *>(weight), static_cast<const T *>(bias), static_cast<T *>(output), rows,
                     columns, inner);
@@ -460,6 +602,11 @@ extern "C" ROCMKERNELS_EXPORT int linear_nt(const void *input, const void *weigh
         int inner, ROCmKernels::Kernels::DType dtype, hipStream_t stream) {
     return dispatch_linear<float, false, true>(input, weight, bias, output, rows, columns, inner, dtype, stream);
 }
+
+
+
+
+
 
 
 

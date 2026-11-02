@@ -43,17 +43,26 @@ per thread pay the per-block prologue (global loads, two barriers per K tile) ei
 
 ## Our kernel next to it
 
-`LinearActFast` fp16 uses MT64x64x32, 16x16 threads, thread tile 4x4 (16 outputs), 2-half loads.
+`LinearActFast` fp16 now uses two wide tiles, 256 threads, 32 outputs per thread:
 
-Same process, 256 MiB cold flush, median of 20, fp16:
+| case | tile | thread tile | K tile |
+| --- | --- | --- | --- |
+| output width > 128 | 128 rows x 64 columns | 8x4 | 64 |
+| output width <= 128 | 64 rows x 128 columns | 4x8 | 32 |
+
+Same process, same protocol (256 MiB flush, events around a 25-launch batch), fp16:
 
 | case | torch | LinearActFast (K-major weights) | ratio |
 | --- | ---: | ---: | ---: |
-| ffn up 8192x8192x128 | 2.434 ms | 2.462 ms | 1.01x |
-| ffn down 8192x128x8192 | 1.864 ms | 2.626 ms | 1.41x |
+| ffn up 8192x8192x128 | 2.346 ms | 2.005 ms | 0.85x (ours faster) |
+| ffn down 8192x128x8192 | 1.596 ms | 2.232 ms | 1.40x |
 
-The up shape is at parity. The down shape needs the 128x256 macro tile, 8x16 thread tile and
-16-byte vector loads to match rocBLAS.
+The up projection now beats rocBLAS by about 17%. The down projection is still behind: it is the
+one shape where the 32-outputs-per-thread tile cannot cover the whole output, and closing the gap
+needs the same 128x256 macro tile Tensile uses, which does not fit the 64 KiB VGPR file at 256
+threads. The remaining loss is scheduling, not arithmetic: the kernel reaches ~7.7 TFLOP/s against
+rocBLAS at ~10.8, and the disassembly shows the per-k-step LDS loads are issued and immediately
+waited on instead of being pipelined across k-steps.
 
 Weight layout: `F.linear` stores weights as `[out, in]`. `linear_nt` takes that layout directly but
 is 1.7x slower than the K-major path (its coalescing is worse at K=128), so the practical wiring is
@@ -70,3 +79,4 @@ $env:TENSILE_DB = "0xffff"        # prints the selected kernel name
 The Python comparison harness is `tools/TorchCompare/compare_ops.py`; it loads
 `ROCmKernels.Kernels.Shared.dll` (build with `-DBUILD_SHARED_KERNELS=ON`) and runs torch and our
 kernels back to back in one process, which is the only way to compare across the clock drift.
+

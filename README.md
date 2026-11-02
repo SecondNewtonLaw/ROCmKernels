@@ -119,7 +119,7 @@ The measured set on this card covers the vector, MUFU, integer, dot-product, LDS
 
 The reference for the training shapes is `docs/torch-gemm-reference.md`: the exact `rocblas_gemm_ex` calls torch makes, the Tensile kernels it selects (128x128x16 for the up projection, 128x256x16 for the down projection) and how they compare with `LinearActFast`.
 
-The worked example is the fp16 GEMM: the compiler's fp32 path is LDS-bound at 5.25 TFLOP/s, and a hand-written `v_dot2_f32_f16` path with K-contiguous half tiles reaches 8.53 TFLOP/s. The same instruction on the wrong layout is slower, so every hand-written sequence is benchmarked against the compiler's.
+The worked example is the fp16 GEMM: the compiler's fp32 path is LDS-bound at 5.25 TFLOP/s, and a hand-written `v_dot2_f32_f16` path with K-contiguous half tiles reaches 11.3 TFLOP/s on the square case and 9.6 TFLOP/s on the 8192x8192x128 FFN shape. The same instruction on the wrong layout is slower, so every hand-written sequence is benchmarked against the compiler's.
 
 The measurements then fed back into the ported kernels. `Softmax` and `RMSNorm` re-read the row from global memory for every pass; staging the row in shared memory once and reading it from LDS cut `Softmax` to 0.090 ms (fp32) and 0.082 ms (fp16) from 0.115 and 0.135, and `RMSNorm` fp32 to 0.084 ms from 0.098. The `LayerNormScaleAdd` forward stages the fused `x + scale*z` value and gains 7-11%. The same knowledge predicted a regression before it was committed: widening the fp16 GEMM's shared reads to `ds_read2_b64` needed a 16-byte tile pitch, which turned the transposed B stores 32-way conflicted and dropped the kernel from 8.52 to 4.99 TFLOP/s. It was reverted, and the write-bank rule is now part of the skill.
 
@@ -232,5 +232,6 @@ An installation can compile gfx1031 code and still fail to detect the card. The 
 | `BUILD_PROFILING_TOOLS` | `OFF` | Build `OpenClProbe` for the profiling skill |
 | `BUILD_ISA_BENCH` | `ON` | Build the RDNA2 instruction microbenchmark |
 | `ROCMKERNELS_EMIT_ASSEMBLY` | `ON` | Provide the `ROCmKernels.Assembly` target |
+
 
 
