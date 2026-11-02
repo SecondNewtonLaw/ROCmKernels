@@ -92,8 +92,8 @@ TEST_CASE("Muon prepare, gram, multiply and apply match the reference", "[muon][
     std::vector<float> expectedY(elements);
     double expectedSumsq = 0;
     for (int index = 0; index < elements; ++index) {
-        expectedBuffer[index] = initialBuffer[index] * momentum + gradient[index];
-        expectedY[index] = gradient[index] + momentum * expectedBuffer[index];
+        expectedBuffer[index] = initialBuffer[index] + (1.0f - momentum) * (gradient[index] - initialBuffer[index]);
+        expectedY[index] = gradient[index] + momentum * (expectedBuffer[index] - gradient[index]);
         expectedSumsq += static_cast<double>(expectedY[index]) * expectedY[index];
     }
 
@@ -198,3 +198,4 @@ TEST_CASE("Muon leaves dead matrices untouched", "[muon][optimizer]") {
     deviceBuffer.CopyToHost(actualBuffer.data(), actualBuffer.size());
     ROCmKernels::Tests::CheckClose(initialBuffer, actualBuffer, 0.0);
 }
+

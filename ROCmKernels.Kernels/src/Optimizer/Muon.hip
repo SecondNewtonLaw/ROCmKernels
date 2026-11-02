@@ -41,9 +41,10 @@ static __global__ void prep_kernel(const int64_t* gradients, const int64_t* buff
         for (int k = threadIdx.y; k < 32; k += 8) {
             const int64_t index = static_cast<int64_t>(r0 + k) * columns + c0 + threadIdx.x;
             const float gv = g[index], bv = buffer[index];
-            const float next = live ? bv * momentum + gv : bv;
+            // reactive.MuonNS: buf = buf + (1-m)(g - buf), then g = g + m(buf - g).
+            const float next = live ? bv + (1.0f - momentum) * (gv - bv) : bv;
             if (live) buffer[index] = next;
-            const float z = gv + momentum * next;
+            const float z = gv + momentum * (next - gv);
             tile[k][threadIdx.x] = z;
             local += z * z;
         }
@@ -55,9 +56,10 @@ static __global__ void prep_kernel(const int64_t* gradients, const int64_t* buff
         for (int64_t index = (static_cast<int64_t>(blockIdx.x) * 8 + threadIdx.y) * 32 + threadIdx.x; index < total;
              index += static_cast<int64_t>(gridDim.x) * 256) {
             const float gv = g[index], bv = buffer[index];
-            const float next = live ? bv * momentum + gv : bv;
+            // reactive.MuonNS: buf = buf + (1-m)(g - buf), then g = g + m(buf - g).
+            const float next = live ? bv + (1.0f - momentum) * (gv - bv) : bv;
             if (live) buffer[index] = next;
-            const float z = gv + momentum * next;
+            const float z = gv + momentum * (next - gv);
             out[index] = z;
             local += z * z;
         }
@@ -260,3 +262,4 @@ extern "C" ROCMKERNELS_EXPORT int muon_fp32_apply(const float* y, const float* b
                        0.0f, 0.0f, mode, 0.0f, params, flags, decay_factor, step, transposed);
     return hipGetLastError();
 }
+
