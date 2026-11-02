@@ -149,10 +149,13 @@ extern "C" ROCMKERNELS_EXPORT int broadcast_binary_forward(const void *a, const 
     else if (mode == BroadcastMode::Row) operandElements = columns;
     else if (mode == BroadcastMode::Column) operandElements = rows;
     const std::size_t elementSize = dtype == DType::Float16 ? sizeof(__half) : sizeof(float);
+    const std::size_t outputBytes = static_cast<std::size_t>(outputElements) * elementSize;
+
+    // Only exact in-place aliasing is safe; partial overlap would let one row clobber another row's input.
+    if (a != out && RangesOverlap(a, outputBytes, out, outputBytes)) return hipErrorInvalidValue;
 
     // b is reused across rows, so an overlapping output would make the result depend on block ordering.
-    if (RangesOverlap(b, static_cast<std::size_t>(operandElements) * elementSize, out, static_cast<std::size_t>(outputElements) * elementSize))
-        return hipErrorInvalidValue;
+    if (RangesOverlap(b, static_cast<std::size_t>(operandElements) * elementSize, out, outputBytes)) return hipErrorInvalidValue;
 
     switch (dtype) {
         case DType::Float32:

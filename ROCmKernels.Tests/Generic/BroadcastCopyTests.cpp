@@ -249,4 +249,35 @@ TEST_CASE("Broadcast binary and fill validate their arguments", "[generic][valid
         CHECK(broadcast_binary_forward(&a, &b, &b, 1, 1, BinaryOp::Add, BroadcastMode::Scalar, DType::Float32, nullptr) ==
                 hipErrorInvalidValue);
     }
+
+    SECTION("broadcast rejects a partially overlapping first operand") {
+        float a[8]{1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f, 7.0f, 8.0f};
+        float b = 1.0f;
+
+        CHECK(broadcast_binary_forward(a, &b, a + 1, 2, 2, BinaryOp::Add, BroadcastMode::Scalar, DType::Float32, nullptr) ==
+                hipErrorInvalidValue);
+    }
+}
+
+TEST_CASE("Broadcast binary supports exact in-place output", "[generic][broadcast]") {
+    using ROCmKernels::Kernels::BinaryOp;
+    using ROCmKernels::Kernels::BroadcastMode;
+
+    const std::vector<float> a{1.0f, 2.0f, 3.0f, 4.0f};
+    const std::vector<float> b{0.5f, 1.0f};
+    const std::vector<float> expected{1.5f, 3.0f, 3.5f, 5.0f};
+
+    ROCmKernels::DeviceBuffer<float> deviceA(a.size());
+    ROCmKernels::DeviceBuffer<float> deviceB(b.size());
+    deviceA.CopyFromHost(a.data(), a.size());
+    deviceB.CopyFromHost(b.data(), b.size());
+
+    ROCmKernels::Kernels::BroadcastBinary(deviceA.Data(), deviceB.Data(), deviceA.Data(), 2, 2, BinaryOp::Add, BroadcastMode::Row,
+            ROCmKernels::Kernels::DTypeOf<float>::value);
+    ROCMKERNELS_HIP_CHECK(hipDeviceSynchronize());
+
+    std::vector<float> actual(a.size());
+    deviceA.CopyToHost(actual.data(), actual.size());
+
+    ROCmKernels::Tests::CheckClose(expected, actual, 0.0);
 }
