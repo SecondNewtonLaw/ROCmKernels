@@ -56,6 +56,61 @@ namespace {
         return scratch[0];
     }
 
+    __device__ __forceinline__ float wave_all_max(float value) {
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) value = fmaxf(value, __shfl_xor(value, offset, 32));
+        return value;
+    }
+
+    __device__ __forceinline__ float wave_all_sum(float value) {
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) value += __shfl_xor(value, offset, 32);
+        return value;
+    }
+
+    // One wave per row while the row fits in registers: no shared memory or barriers.
+    template<typename T, bool HasMask, int PerLane>
+    __global__ __launch_bounds__(kThreads) void softmax_forward_wave_kernel(const T *input, const bool *mask, T *output, const int rows,
+            const int columns, const float scale) {
+        const int lane = threadIdx.x % 32;
+        const int row = blockIdx.x * kWarps + threadIdx.x / 32;
+        if (row >= rows) return;
+        const std::size_t base = std::size_t(row) * columns;
+
+        float values[PerLane];
+        float maximum = -INFINITY;
+        #pragma unroll
+        for (int i = 0; i < PerLane; ++i) {
+            const int column = i * 32 + lane;
+            float value = -INFINITY;
+            if (column < columns) {
+                value = ROCmKernels::Kernels::LoadScalar(input + base + column) * scale;
+                if constexpr (HasMask) {
+                    if (!mask[base + column]) value = -INFINITY;
+                }
+            }
+            values[i] = value;
+            maximum = fmaxf(maximum, value);
+        }
+        maximum = wave_all_max(maximum);
+
+        float sum = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < PerLane; ++i) {
+            values[i] = values[i] != -INFINITY ? __expf(values[i] - maximum) : 0.0f;
+            sum += values[i];
+        }
+        sum = wave_all_sum(sum);
+
+        const float inverse = sum > 0.0f ? 1.0f / sum : 0.0f;
+        #pragma unroll
+        for (int i = 0; i < PerLane; ++i) {
+            const int column = i * 32 + lane;
+            if (column >= columns) break;
+            ROCmKernels::Kernels::StoreScalar(output + base + column, values[i] * inverse);
+        }
+    }
+
     template<typename T, bool HasMask>
     __global__ void softmax_forward_staged_kernel(const T *input, const bool *mask, T *output, const int columns, const float scale) {
         // One global read per element; the max, sum and output passes read the row from LDS,
@@ -65,13 +120,27 @@ namespace {
         __shared__ float sumScratch[kWarps];
 
         const std::size_t base = std::size_t(blockIdx.x) * columns;
+        const bool paired = columns % 2 == 0;
 
-        for (int column = threadIdx.x; column < columns; column += kThreads) {
-            float value = ROCmKernels::Kernels::LoadScalar(input + base + column) * scale;
-            if constexpr (HasMask) {
-                if (!mask[base + column]) value = -INFINITY;
+        if (paired) {
+            for (int column = threadIdx.x * 2; column < columns; column += kThreads * 2) {
+                float2 value = ROCmKernels::Kernels::LoadPair(input + base + column);
+                value.x *= scale;
+                value.y *= scale;
+                if constexpr (HasMask) {
+                    if (!mask[base + column]) value.x = -INFINITY;
+                    if (!mask[base + column + 1]) value.y = -INFINITY;
+                }
+                *reinterpret_cast<float2 *>(staged + column) = value;
             }
-            staged[column] = value;
+        } else {
+            for (int column = threadIdx.x; column < columns; column += kThreads) {
+                float value = ROCmKernels::Kernels::LoadScalar(input + base + column) * scale;
+                if constexpr (HasMask) {
+                    if (!mask[base + column]) value = -INFINITY;
+                }
+                staged[column] = value;
+            }
         }
         __syncthreads();
 
@@ -87,6 +156,15 @@ namespace {
         sum = block_sum(sum, sumScratch);
 
         const float inverse = sum > 0.0f ? 1.0f / sum : 0.0f;
+        if (paired) {
+            for (int column = threadIdx.x * 2; column < columns; column += kThreads * 2) {
+                const float2 value = *reinterpret_cast<const float2 *>(staged + column);
+                const float2 probability = sum > 0.0f ? make_float2(__expf(value.x - maximum) * inverse, __expf(value.y - maximum) * inverse)
+                                                      : make_float2(0.0f, 0.0f);
+                ROCmKernels::Kernels::StorePair(output + base + column, probability);
+            }
+            return;
+        }
         for (int column = threadIdx.x; column < columns; column += kThreads) {
             const float value = staged[column];
             const float probability = sum > 0.0f ? __expf(value - maximum) * inverse : 0.0f;
@@ -138,6 +216,16 @@ namespace {
             hipStream_t stream) {
         const dim3 grid(rows);
         const dim3 block(kThreads);
+
+        const auto wave = [&](auto masked, auto unmasked) {
+            hipLaunchKernelGGL(mask != nullptr ? masked : unmasked, dim3((rows + kWarps - 1) / kWarps), block, 0, stream,
+                    static_cast<const T *>(input), mask, static_cast<T *>(output), rows, columns, scale);
+            return hipGetLastError();
+        };
+        if (columns <= 128) return wave(softmax_forward_wave_kernel<T, true, 4>, softmax_forward_wave_kernel<T, false, 4>);
+        if (columns <= 256) return wave(softmax_forward_wave_kernel<T, true, 8>, softmax_forward_wave_kernel<T, false, 8>);
+        if (columns <= 512) return wave(softmax_forward_wave_kernel<T, true, 16>, softmax_forward_wave_kernel<T, false, 16>);
+        if (columns <= 1024) return wave(softmax_forward_wave_kernel<T, true, 32>, softmax_forward_wave_kernel<T, false, 32>);
 
         // The mask becomes a template parameter so the loops stay branch-free.
         if (columns <= kStageColumns) {
