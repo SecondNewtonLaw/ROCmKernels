@@ -71,7 +71,7 @@ static __global__ void loss_forward(const float* logits, const int64_t* targets,
 }
 
 static __global__ void loss_backward(const float* logits, const int64_t* targets, const float* statistics,
-                                    const float* upstream, float* gradient, int classes, int stride, int grad_stride) {
+                                    const float* upstream, float* gradient, int classes, int stride, int upstream_stride) {
     const int column = blockIdx.x * THREADS + threadIdx.x;
     const int row = blockIdx.y;
     if (column >= classes) return;
@@ -81,7 +81,7 @@ static __global__ void loss_backward(const float* logits, const int64_t* targets
     float value;
     if (target == -100) value = isnan(logarithm) ? NAN : 0.0f;
     else {
-        const float scale = upstream[row * grad_stride];
+        const float scale = upstream[row * upstream_stride];
         const float probability = expf((logits[row * stride + column] - maximum) - logarithm);
         value = fmaf(probability, scale, column == target ? -scale : 0.0f);
     }
@@ -100,10 +100,11 @@ extern "C" ROCMKERNELS_EXPORT int cross_entropy_fp32_forward(const float* logits
 
 extern "C" ROCMKERNELS_EXPORT int cross_entropy_fp32_backward(const float* logits, const int64_t* targets,
                                                   const float* statistics, const float* upstream, float* gradient,
-                                                  int rows, int classes, int stride, int grad_stride, hipStream_t stream) {
+                                                  int rows, int classes, int stride, int upstream_stride, hipStream_t stream) {
     if (!logits || !targets || !statistics || !upstream || !gradient || rows <= 0 || rows > 65535 ||
-        classes <= 0 || stride < 0 || grad_stride < 0) return hipErrorInvalidValue;
+        classes <= 0 || stride < 0 || upstream_stride < 0) return hipErrorInvalidValue;
     hipLaunchKernelGGL(loss_backward, dim3((classes + THREADS - 1) / THREADS, rows), dim3(THREADS), 0,
-                      stream, logits, targets, statistics, upstream, gradient, classes, stride, grad_stride);
+                      stream, logits, targets, statistics, upstream, gradient, classes, stride, upstream_stride);
     return hipGetLastError();
 }
+

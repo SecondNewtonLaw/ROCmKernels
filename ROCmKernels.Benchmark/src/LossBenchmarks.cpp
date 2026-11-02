@@ -87,6 +87,8 @@ namespace {
         Registrar() {
             ROCmKernels::Benchmark::Register(MakeForwardCase(512, 32768));
             ROCmKernels::Benchmark::Register(MakeBackwardCase(512, 32768));
+            ROCmKernels::Benchmark::Register(MakeForwardCase(1200, 55765));
+            ROCmKernels::Benchmark::Register(MakeBackwardCase(1200, 55765));
         }
     };
 
