@@ -145,14 +145,32 @@ Current results are in `references/rdna2-isa.md`. The harness is deliberately sm
 for each instruction you need. Keep one wave for latency and use independent chains for
 throughput. The absolute numbers are less important than the comparison between two sequences.
 
+The headline numbers that change decisions:
+
+- Every VALU instruction issues at ~1.75 cycles per wave, latency ~6.1. Encoding width does not
+  matter; `v_fma_f32` (VOP3) and `v_add_f32` (VOP2) cost the same.
+- MUFU (`v_exp_f32`, `v_rcp_f32`, ...) and `v_mul_lo_u32` are half rate: ~4.6 cycles issue, ~10.8
+  latency. Keep them off the critical path.
+- LDS reads are conflict-free at every stride tested, including all lanes in one bank. LDS writes
+  are banked and a 32-way conflict costs 4.4x.
+- `ds_read_b128` moves 4x the data for 1.9x the issue cost of `ds_read_b32`; `ds_read_b64` is free
+  over `b32`. Tile loads should use the widest read the layout allows.
+- A load, wait, compute loop is additive. Software-pipeline the next tile's loads before the
+  current tile's math.
+- SALU does not hide under VALU: 32 scalar adds added ~3 cycles per vector op in the mix test.
+
 ## Pitfalls
 
 - **The runtime reports 18 compute units, but the card has 36 CUs.** `multiProcessorCount` is the
   WGP count. Peak fp32 uses 36 CUs.
 - **Wave32 issue is two cycles per instruction per SIMD16.** One wave cannot saturate a CU; use at
-  least two waves per SIMD.
-- **LDS bank conflicts.** Pad a row-major array by one element, or make the stride odd. A 33-float
-  pitch is the standard trick; a 65-float pitch works for 64-wide tiles.
+  least two waves per SIMD. More waves do not improve the per-wave issue interval; they only hide
+  memory and MUFU latency.
+- **LDS read padding is usually wasted; LDS write padding is not.** Reads showed no bank penalty at
+  stride 1, 2, 4, 8, 16 or 32 on this card. Stores showed a 4.4x penalty at stride 32. Pad arrays
+  that are written by scattered lanes, not ones that are only read.
+- **Inline asm must declare implicit flag writes.** `s_add_u32` needs an `"scc"` clobber. Without
+  it the scheduler moved a loop compare across the asm and the loop ran once.
 - **Vectorizing shared reads is not always faster.** A K-contiguous `float4` layout on the fp32
   GEMM raised VGPRs to 117 and regressed from 5.25 to 3.2 TFLOP/s because the compiler still emitted
   `ds_read2` and occupancy dropped. Measure.

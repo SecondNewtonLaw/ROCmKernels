@@ -127,6 +127,7 @@ if (ROCMKERNELS_EMIT_ASSEMBLY)
     set(ROCMKERNELS_ASSEMBLY_OUTPUTS "")
 
     foreach (_kernel_source IN LISTS ROCMKERNELS_KERNEL_SOURCES)
+        get_filename_component(_kernel_source "${_kernel_source}" ABSOLUTE)
         get_filename_component(_kernel_name "${_kernel_source}" NAME_WE)
         set(_assembly_output "${ROCMKERNELS_ASSEMBLY_DIRECTORY}/${_kernel_name}.s")
 
@@ -139,9 +140,9 @@ if (ROCMKERNELS_EMIT_ASSEMBLY)
                         "-I${CMAKE_CURRENT_SOURCE_DIR}/ROCmKernels.Kernels/include"
                         "-I${CMAKE_CURRENT_SOURCE_DIR}/ROCmKernels.Common/include"
                         "-isystem" "${ROCM_HIP_INCLUDE_DIR}"
-                        "${CMAKE_CURRENT_SOURCE_DIR}/${_kernel_source}"
+                        "${_kernel_source}"
                         -o "${_assembly_output}"
-                DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/${_kernel_source}" ${ROCMKERNELS_KERNEL_HEADERS}
+                DEPENDS "${_kernel_source}" ${ROCMKERNELS_KERNEL_HEADERS}
                 VERBATIM
         )
         list(APPEND ROCMKERNELS_ASSEMBLY_OUTPUTS "${_assembly_output}")

@@ -20,8 +20,9 @@ Sources:
   two cycles, so one wave32 issues at most one instruction per two cycles per SIMD. Several waves
   per SIMD are needed to fill issue slots.
 - RDNA2 is wave32-native and also supports wave64. Kernels in this repository are wave32.
-- LDS is 64 KB per CU (128 KB per WGP). It is 32 banks of 32 bits. Two lanes hitting the same bank
-  with different addresses serialize.
+- LDS is 64 KB per CU (128 KB per WGP). It is 32 banks of 32 bits. On this card reads are served by a
+  crossbar that handles any 32-lane pattern without a bank penalty; writes are banked and
+  same-bank stores serialize (see the measured table below).
 - VGPRs are allocated per wave in granularity. The compiler reports the real count as
   `.amdhsa_next_free_vgpr` in the assembly and `vgpr_count` in the code-object metadata. Use those,
   not a guessed budget. SGPRs are separate and hold uniform values, descriptors and lane selects.
@@ -163,32 +164,106 @@ Cache modifiers on loads/stores:
 - Inline asm is opaque to the scheduler. Put independent instructions in separate asm blocks, or
   write the whole unrolled sequence in one block and schedule it yourself. `asm volatile` prevents
   the compiler from deleting or reordering it.
+- Inline asm that touches a register implicitly must declare it. `s_add_u32`, `s_subb_u32` and every
+  VALU compare write flags the compiler does not see. At minimum `s_add_u32`/`s_sub_u32` need an
+  `"scc"` clobber, otherwise the scheduler will move a loop compare across them and the loop will
+  execute once. This was observed on this project: 32 `s_add_u32` in a loop body broke the loop
+  condition until the clobber was added.
+- A VALU instruction with a memory operand (none on RDNA2) or an inline asm that reads or writes
+  memory needs a `"memory"` clobber; DS instructions in asm need `"memory"` if the compiler also
+  accesses the same shared array.
 
 ## Measured costs on gfx1031
 
 `tools/IsaBench` runs one wave on one CU, measures `s_memtime` cycles, and reports cycles per
-instruction. The numbers below are the first stable set; they include the loop and address-update
-instructions where noted. Use them for relative decisions, then confirm with the real kernel.
+instruction. Latency rows are a dependent chain of 16; throughput rows issue 32 independent
+operations per iteration. The loop overhead is included and is visible in the `v_mov_b32` row.
 
-| measurement | cycles/instruction | note |
+### Vector and scalar ALU
+
+| instruction | latency | issue interval | note |
+| --- | ---: | ---: | --- |
+| `v_mov_b32` | - | 1.75 | issue-rate floor |
+| `v_fma_f32` | 6.13 | 1.78 | VOP3 only |
+| `v_fmac_f32` | 6.06 | 1.76 | VOP2 accumulator form |
+| `v_add_f32` / `v_mul_f32` | 6.13 | 1.75 | |
+| `v_dot2_f32_f16` | 6.28 | 1.76 | two MACs per instruction |
+| `v_dot4c_i32_i8` | 6.13 | 1.72 | four int8 MACs per instruction |
+| `v_pk_fma_f16` | 6.13 | 1.78 | two fp16 MACs per instruction |
+| `v_add_nc_u32` | 6.13 | 1.72 | |
+| `v_lshlrev_b32` | 6.13 | 1.72 | |
+| `v_mad_u32_u24` | 6.13 | 1.72 | |
+| `v_bfe_u32` | 6.13 | 1.78 | |
+| `v_mul_lo_u32` | 8.94 | 4.59 | half rate, avoid in hot loops |
+| `v_cmp_gt_f32` + `v_cndmask_b32` | 4.66 | 2.05 | per instruction of the pair |
+| `v_exp_f32`, `v_log_f32`, `v_rcp_f32`, `v_sqrt_f32`, `v_rsq_f32` | 10.81 | 4.63 | MUFU, half rate |
+| `s_add_u32` | 3.88 | 1.97 | scalar unit, half rate |
+
+The issue interval is flat at ~1.75 cycles for every VALU encoding, VOP1 through VOP3P. There is no
+throughput advantage to a 32-bit encoding over a 64-bit one; pick instructions by work done, not by
+encoding width. At the measured 2.64 GHz this is two cycles per wave32 instruction per SIMD16, so a
+CU issues at most two wave32 instructions per cycle across its four SIMD16 units.
+
+One wave reaches the same per-wave issue interval as four waves (1.78 / 1.79 / 1.75), so a single
+wave already saturates its SIMD16. More waves hide memory and MUFU latency, not issue.
+
+### LDS
+
+| measurement | cycles | note |
 | --- | ---: | --- |
-| `v_fma_f32` latency | 6.13 | dependent chain |
-| `v_fma_f32` throughput | 1.72 | 8 independent chains, one wave |
-| `v_dot2_f32_f16` latency | 6.13 | dependent chain |
-| `v_dot2_f32_f16` throughput | 1.72 | 8 independent chains |
-| `v_dot4c_i32_i8` latency | 6.13 | dependent chain |
-| `v_dot4c_i32_i8` throughput | 1.72 | 8 independent chains |
-| `v_exp_f32` latency | 10.81 | dependent chain, MUFU |
-| `ds_read_b32` dependent chain | 65.0 | load plus address update and waitcnt |
-| `ds_read_b32` throughput | 3.13 | independent loads, 32 lanes |
+| `ds_read_b32` dependent chain | 34.0 | pure address chase, no conversion |
+| `ds_read_b64` dependent chain | 34.0 | same latency as b32 |
+| `ds_read_b128` dependent chain | 44.0 | +10 cycles for 4x the data |
+| `ds_read_b32` issue | 3.50 | no waitcnt |
+| `ds_read_b64` issue | 3.50 | same as b32 |
+| `ds_read_b128` issue | 6.50 | 2x issue for 4x data, the efficient read |
+| `ds_read2_b32` | 3.00 | per dword, 6.0 per instruction |
+| `ds_write_b32` issue | 3.50 | |
+| `ds_bpermute_b32` | 3.50 | same cost as a load |
+| `ds_read_b32`, stride 1..32 floats | 7.63 | with waitcnt; no bank penalty |
+| `ds_write_b32`, stride 1 | 8.75 | with waitcnt |
+| `ds_write_b32`, stride 32 | 38.9 | 4.4x, 32-way bank conflict |
 
-External reference points measured on RDNA2 by Chips and Cheese: LDS load-to-use about 19.5 ns
-(roughly 42 cycles at 2.17 GHz), scalar cache about 17.4 ns. Those are pure load-to-use numbers;
-the 65-cycle chain above also contains `v_cvt_i32_f32`, the address mask and the waitcnt.
+LDS **reads are conflict-free** on this card for every stride tested, including all 32 lanes hitting
+bank 0 with different addresses. The read crossbar handles an arbitrary permutation of 32 lanes.
+LDS **writes are banked**: the same stride-32 pattern costs 4.4x. Do not waste time padding a
+read-only tile; do avoid same-bank write patterns.
 
-`tools/IsaBench` calibrates `s_memtime` against wall time; the first run reported 2.65 GHz, so the
-table is in core clocks. The boost clock moves with power state, and the loop overhead is included
-in every row. Compare instruction sequences on the same run, not across runs.
+The 34-cycle chain is the real load-to-use number including the loop and the scoreboard wait. A
+`ds_read_b128` costs 10 more cycles of latency but moves 4x the data at 1.9x the issue cost, so tile
+loads should use 128-bit reads where the layout allows it.
+
+### Memory hierarchy (pointer chase, one 128-byte line per step)
+
+| level | cycles | note |
+| --- | ---: | --- |
+| L1, 4 KB working set | 116 | L0/L1 hit |
+| L2, 1 MB working set | 283 | |
+| 8 MB working set | 470 | no separate infinity-cache step |
+| 16 MB working set | 462 | |
+| 32 MB working set | 560 | |
+| DRAM, 256 MB working set | 470 | |
+
+The knee is between 1 MB and 8 MB. The 96 MB infinity cache does not produce a measurable latency
+step for this pattern on this card; treat anything above the L2 as DRAM-latency.
+
+### Issue mixing
+
+| sequence | cycles | note |
+| --- | ---: | --- |
+| 8 `ds_read_b32` + wait | 61 | 7.63 per load with the wait |
+| 8 `ds_read_b32` + wait + 16 `v_fma_f32` | 128 | load, wait, compute is additive |
+| 32 `v_fma_f32` | 57 | 1.78 per FMA |
+| 32 `v_fma_f32` + 32 `s_add_u32` | 230 | scalar ops do not hide vector issue |
+
+A load-wait-compute loop pays the full LDS latency every tile. Software pipelining (issue the next
+tile's loads before the current tile's arithmetic) is worth more than any instruction-selection
+change. The scalar unit shares issue bandwidth with the vector path closely enough that SALU
+address arithmetic is not free; hoist it out of the loop.
+
+`tools/IsaBench` calibrates `s_memtime` against wall time; runs report 2.64-2.65 GHz, so the table is
+in core clocks. The boost clock moves with power state. Compare instruction sequences within one
+run, not across runs.
 
 ## gfx1031 specifics
 
