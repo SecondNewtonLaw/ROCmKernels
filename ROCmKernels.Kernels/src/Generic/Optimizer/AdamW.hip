@@ -4,66 +4,113 @@
 
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <limits>
-#include <vector>
+#include <type_traits>
 
 namespace {
     constexpr int kThreads = 256;
     constexpr int kMaxBlocks = 4096;
+    constexpr int kVector = 4;
+    // Each chunk lies inside one tensor, so a block never searches for its tensor or straddles a boundary.
+    constexpr long long kChunk = kThreads * kVector * 4;
 
     struct DeviceTensor {
         void *parameter;
         const void *gradient;
         float *firstMoment;
         float *secondMoment;
-        long long begin;
-        long long end;
+        long long elements;
+        int vectorized;
     };
 
+    // Passed by value so a step needs no device allocation or host copy; more tensors take several launches.
+    constexpr int kBatch = 32;
+    struct Batch {
+        DeviceTensor tensors[kBatch];
+        int firstChunk[kBatch + 1];
+        int count;
+    };
+
+    struct Step {
+        float learningRate;
+        float beta1;
+        float beta2;
+        float decay;
+        float firstCorrection;
+        float secondCorrection;
+        float epsilon;
+    };
+
+    __device__ __forceinline__ float update(float &first, float &second, const float gradient, const float value, const Step &step) {
+        first = step.beta1 * first + (1.0f - step.beta1) * gradient;
+        second = step.beta2 * second + (1.0f - step.beta2) * gradient * gradient;
+        const float firstHat = first / step.firstCorrection;
+        const float secondHat = second / step.secondCorrection;
+        return value - step.decay * value - step.learningRate * firstHat / (sqrtf(secondHat) + step.epsilon);
+    }
+
     template<typename T>
-    __global__ void adamw_kernel(const DeviceTensor *tensors, const int tensorCount, const long long elements, const float learningRate,
-            const float beta1, const float beta2, const float decay, const float firstCorrection, const float secondCorrection,
-            const float epsilon) {
-        const long long stride = static_cast<long long>(gridDim.x) * blockDim.x;
-        for (long long index = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x; index < elements; index += stride) {
-            // Offsets are contiguous and ordered, so the owning tensor is the last one whose begin is <= index.
-            int low = 0;
-            int high = tensorCount;
-            while (low + 1 < high) {
-                const int middle = (low + high) / 2;
-                if (index < tensors[middle].begin) high = middle;
-                else low = middle;
-            }
-
-            const DeviceTensor &tensor = tensors[low];
-            const long long local = index - tensor.begin;
-            T *parameter = static_cast<T *>(tensor.parameter);
-            const T *gradient = static_cast<const T *>(tensor.gradient);
-
-            const float gradientValue = ROCmKernels::Kernels::LoadScalar(gradient + local);
-            const float first = beta1 * tensor.firstMoment[local] + (1.0f - beta1) * gradientValue;
-            const float second = beta2 * tensor.secondMoment[local] + (1.0f - beta2) * gradientValue * gradientValue;
-            tensor.firstMoment[local] = first;
-            tensor.secondMoment[local] = second;
-
-            const float firstHat = first / firstCorrection;
-            const float secondHat = second / secondCorrection;
-            const float value = ROCmKernels::Kernels::LoadScalar(parameter + local);
-            const float decayed = value - decay * value;
-            const float updated = decayed - learningRate * firstHat / (sqrtf(secondHat) + epsilon);
-            ROCmKernels::Kernels::StoreScalar(parameter + local, updated);
+    __device__ __forceinline__ float4 load4(const T *pointer) {
+        if constexpr (std::is_same_v<T, __half>) {
+            const float2 low = ROCmKernels::Kernels::LoadPair(pointer);
+            const float2 high = ROCmKernels::Kernels::LoadPair(pointer + 2);
+            return make_float4(low.x, low.y, high.x, high.y);
+        } else {
+            return *reinterpret_cast<const float4 *>(pointer);
         }
     }
 
     template<typename T>
-    hipError_t launch(const DeviceTensor *tensors, const int tensorCount, const long long elements, const float learningRate, const float beta1,
-            const float beta2, const float decay, const float firstCorrection, const float secondCorrection, const float epsilon,
-            const hipStream_t stream) {
-        const long long requestedBlocks = (elements + kThreads - 1) / kThreads;
-        const unsigned int blocks = static_cast<unsigned int>(requestedBlocks < kMaxBlocks ? requestedBlocks : kMaxBlocks);
-        hipLaunchKernelGGL((adamw_kernel<T>), dim3(blocks), dim3(kThreads), 0, stream, tensors, tensorCount, elements, learningRate, beta1,
-                beta2, decay, firstCorrection, secondCorrection, epsilon);
-        return hipGetLastError();
+    __device__ __forceinline__ void store4(T *pointer, const float4 value) {
+        if constexpr (std::is_same_v<T, __half>) {
+            ROCmKernels::Kernels::StorePair(pointer, make_float2(value.x, value.y));
+            ROCmKernels::Kernels::StorePair(pointer + 2, make_float2(value.z, value.w));
+        } else {
+            *reinterpret_cast<float4 *>(pointer) = value;
+        }
+    }
+
+    template<typename T>
+    __global__ __launch_bounds__(kThreads) void adamw_kernel(const Batch batch, const Step step) {
+        for (int chunkIndex = blockIdx.x; chunkIndex < batch.firstChunk[batch.count]; chunkIndex += gridDim.x) {
+            int owner = 0;
+            while (batch.firstChunk[owner + 1] <= chunkIndex) ++owner;
+            const DeviceTensor &tensor = batch.tensors[owner];
+            T *parameter = static_cast<T *>(tensor.parameter);
+            const T *gradient = static_cast<const T *>(tensor.gradient);
+            const long long begin = static_cast<long long>(chunkIndex - batch.firstChunk[owner]) * kChunk;
+            const long long end = begin + kChunk < tensor.elements ? begin + kChunk : tensor.elements;
+
+            long long scalarBegin = begin;
+            if (tensor.vectorized) {
+                scalarBegin = begin + (end - begin) / kVector * kVector;
+                for (long long index = begin + threadIdx.x * kVector; index < scalarBegin; index += kThreads * kVector) {
+                    const float4 g = load4(gradient + index);
+                    const float4 value = load4(parameter + index);
+                    float4 first = *reinterpret_cast<const float4 *>(tensor.firstMoment + index);
+                    float4 second = *reinterpret_cast<const float4 *>(tensor.secondMoment + index);
+                    float4 updated;
+                    updated.x = update(first.x, second.x, g.x, value.x, step);
+                    updated.y = update(first.y, second.y, g.y, value.y, step);
+                    updated.z = update(first.z, second.z, g.z, value.z, step);
+                    updated.w = update(first.w, second.w, g.w, value.w, step);
+                    *reinterpret_cast<float4 *>(tensor.firstMoment + index) = first;
+                    *reinterpret_cast<float4 *>(tensor.secondMoment + index) = second;
+                    store4(parameter + index, updated);
+                }
+            }
+
+            for (long long index = scalarBegin + threadIdx.x; index < end; index += kThreads) {
+                float first = tensor.firstMoment[index];
+                float second = tensor.secondMoment[index];
+                const float updated = update(first, second, ROCmKernels::Kernels::LoadScalar(gradient + index),
+                        ROCmKernels::Kernels::LoadScalar(parameter + index), step);
+                tensor.firstMoment[index] = first;
+                tensor.secondMoment[index] = second;
+                ROCmKernels::Kernels::StoreScalar(parameter + index, updated);
+            }
+        }
     }
 } // namespace
 
@@ -78,50 +125,52 @@ extern "C" ROCMKERNELS_EXPORT int adamw_multi(const ROCmKernels::Kernels::AdamWT
         (dtype != DType::Float32 && dtype != DType::Float16))
         return hipErrorInvalidValue;
 
-    std::vector<DeviceTensor> descriptors;
-    descriptors.reserve(static_cast<std::size_t>(tensorCount));
+    const std::size_t elementBytes = dtype == DType::Float16 ? sizeof(__half) : sizeof(float);
+    const auto aligned = [](const void *pointer, const std::size_t bytes) { return reinterpret_cast<std::uintptr_t>(pointer) % bytes == 0; };
 
-    long long elements = 0;
     for (int index = 0; index < tensorCount; ++index) {
         const AdamWTensor &tensor = tensors[index];
         if (tensor.elements <= 0) continue;
         if (!tensor.parameter || !tensor.gradient || !tensor.firstMoment || !tensor.secondMoment) return hipErrorInvalidValue;
-
-        // The offsets passed to the kernel are signed 64-bit, so the fused total must fit as well.
-        if (tensor.elements > std::numeric_limits<long long>::max() - elements) return hipErrorInvalidValue;
-        descriptors.push_back(DeviceTensor{tensor.parameter, tensor.gradient, tensor.firstMoment, tensor.secondMoment, elements,
-                elements + tensor.elements});
-        elements += tensor.elements;
     }
 
-    if (descriptors.empty()) return hipSuccess;
+    const Step parameters{learningRate, beta1, beta2, learningRate * weightDecay,
+            static_cast<float>(1.0 - std::pow(static_cast<double>(beta1), static_cast<double>(step))),
+            static_cast<float>(1.0 - std::pow(static_cast<double>(beta2), static_cast<double>(step))), epsilon};
 
-    const float firstCorrection = static_cast<float>(1.0 - std::pow(static_cast<double>(beta1), static_cast<double>(step)));
-    const float secondCorrection = static_cast<float>(1.0 - std::pow(static_cast<double>(beta2), static_cast<double>(step)));
-    const float decay = learningRate * weightDecay;
+    Batch batch{};
+    const auto flush = [&]() {
+        if (batch.count == 0) return hipSuccess;
+        const int chunks = batch.firstChunk[batch.count];
+        const dim3 blocks(chunks < kMaxBlocks ? chunks : kMaxBlocks);
+        if (dtype == DType::Float32) hipLaunchKernelGGL((adamw_kernel<float>), blocks, dim3(kThreads), 0, stream, batch, parameters);
+        else hipLaunchKernelGGL((adamw_kernel<__half>), blocks, dim3(kThreads), 0, stream, batch, parameters);
+        batch.count = 0;
+        return hipGetLastError();
+    };
 
-    DeviceTensor *deviceTensors = nullptr;
-    hipError_t status = hipMalloc(reinterpret_cast<void **>(&deviceTensors), descriptors.size() * sizeof(DeviceTensor));
-    if (status != hipSuccess) return status;
+    for (int index = 0; index < tensorCount; ++index) {
+        const AdamWTensor &tensor = tensors[index];
+        if (tensor.elements <= 0) continue;
 
-    status = hipMemcpy(deviceTensors, descriptors.data(), descriptors.size() * sizeof(DeviceTensor), hipMemcpyHostToDevice);
-    if (status == hipSuccess) {
-        switch (dtype) {
-            case DType::Float32:
-                status = launch<float>(deviceTensors, static_cast<int>(descriptors.size()), elements, learningRate, beta1, beta2, decay,
-                        firstCorrection, secondCorrection, epsilon, stream);
-                break;
-            case DType::Float16:
-                status = launch<__half>(deviceTensors, static_cast<int>(descriptors.size()), elements, learningRate, beta1, beta2, decay,
-                        firstCorrection, secondCorrection, epsilon, stream);
-                break;
-            default:
-                status = hipErrorInvalidValue;
-                break;
+        const long long chunks = (tensor.elements + kChunk - 1) / kChunk;
+        if (chunks > std::numeric_limits<int>::max() - batch.firstChunk[batch.count]) {
+            const hipError_t status = flush();
+            if (status != hipSuccess) return status;
+            if (chunks > std::numeric_limits<int>::max()) return hipErrorInvalidValue;
+        }
+
+        const bool vectorized = aligned(tensor.parameter, kVector * elementBytes) && aligned(tensor.gradient, kVector * elementBytes) &&
+                                aligned(tensor.firstMoment, kVector * sizeof(float)) && aligned(tensor.secondMoment, kVector * sizeof(float));
+        batch.tensors[batch.count] = DeviceTensor{tensor.parameter, tensor.gradient, tensor.firstMoment, tensor.secondMoment,
+                tensor.elements, vectorized ? 1 : 0};
+        batch.firstChunk[batch.count + 1] = batch.firstChunk[batch.count] + static_cast<int>(chunks);
+        ++batch.count;
+
+        if (batch.count == kBatch) {
+            const hipError_t status = flush();
+            if (status != hipSuccess) return status;
         }
     }
-
-    // hipFree waits for the launch, so the descriptor array cannot be released before the kernel reads it.
-    const hipError_t freeStatus = hipFree(deviceTensors);
-    return static_cast<int>(status != hipSuccess ? status : freeStatus);
+    return flush();
 }
