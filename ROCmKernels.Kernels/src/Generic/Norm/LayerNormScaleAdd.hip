@@ -8,6 +8,9 @@
 namespace {
     constexpr int kThreads = 256;
     constexpr int kWarps = kThreads / 32;
+    // Rows up to this width keep the fused x + scale*z value in shared memory,
+    // so the normalization pass does not repeat the three global loads.
+    constexpr int kStageColumns = 4096;
 
     __device__ __forceinline__ float wave_sum(float value) {
         #pragma unroll
@@ -40,6 +43,42 @@ namespace {
         __syncthreads();
         first = scratch[0];
         second = scratch[kWarps];
+    }
+
+    template<typename T>
+    __global__ void layernorm_scale_add_forward_staged_kernel(const T *x, const T *z, const T *scale, const T *weight, const T *bias,
+            T *output, float *statistics, const int columns, const float epsilon) {
+        __shared__ float staged[kStageColumns];
+        __shared__ float scratch[2 * kWarps];
+
+        const std::size_t base = std::size_t(blockIdx.x) * columns;
+
+        float sum = 0.0f;
+        float squareSum = 0.0f;
+        for (int column = threadIdx.x; column < columns; column += kThreads) {
+            const float value = ROCmKernels::Kernels::LoadScalar(x + base + column) +
+                                ROCmKernels::Kernels::LoadScalar(scale + column) * ROCmKernels::Kernels::LoadScalar(z + base + column);
+            staged[column] = value;
+            sum += value;
+            squareSum += value * value;
+        }
+        block_reduce_pair(sum, squareSum, scratch);
+
+        const float mean = sum / static_cast<float>(columns);
+        const float variance = fmaxf(squareSum / static_cast<float>(columns) - mean * mean, 0.0f);
+        const float rstd = rsqrtf(variance + epsilon);
+
+        for (int column = threadIdx.x; column < columns; column += kThreads) {
+            float normalized = (staged[column] - mean) * rstd;
+            if (weight != nullptr) normalized *= ROCmKernels::Kernels::LoadScalar(weight + column);
+            if (bias != nullptr) normalized += ROCmKernels::Kernels::LoadScalar(bias + column);
+            ROCmKernels::Kernels::StoreScalar(output + base + column, normalized);
+        }
+
+        if (threadIdx.x == 0) {
+            statistics[blockIdx.x * 2] = mean;
+            statistics[blockIdx.x * 2 + 1] = rstd;
+        }
     }
 
     template<typename T>
@@ -130,6 +169,13 @@ namespace {
     template<typename T>
     int launch_forward(const void *x, const void *z, const void *scale, const void *weight, const void *bias, void *output, float *statistics,
             const int rows, const int columns, const float epsilon, hipStream_t stream) {
+        if (columns <= kStageColumns) {
+            hipLaunchKernelGGL((layernorm_scale_add_forward_staged_kernel<T>), dim3(rows), dim3(kThreads), 0, stream,
+                    static_cast<const T *>(x), static_cast<const T *>(z), static_cast<const T *>(scale), static_cast<const T *>(weight),
+                    static_cast<const T *>(bias), static_cast<T *>(output), statistics, columns, epsilon);
+            return hipGetLastError();
+        }
+
         hipLaunchKernelGGL((layernorm_scale_add_forward_kernel<T>), dim3(rows), dim3(kThreads), 0, stream,
                 static_cast<const T *>(x), static_cast<const T *>(z), static_cast<const T *>(scale), static_cast<const T *>(weight),
                 static_cast<const T *>(bias), static_cast<T *>(output), statistics, columns, epsilon);

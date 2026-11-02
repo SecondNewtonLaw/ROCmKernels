@@ -168,7 +168,8 @@ The headline numbers that change decisions:
   memory and MUFU latency.
 - **LDS read padding is usually wasted; LDS write padding is not.** Reads showed no bank penalty at
   stride 1, 2, 4, 8, 16 or 32 on this card. Stores showed a 4.4x penalty at stride 32. Pad arrays
-  that are written by scattered lanes, not ones that are only read.
+  that are written by scattered lanes, not ones that are only read. The fp16 GEMM lost 40% when a
+  wider read forced a pitch change that turned its transposed stores 32-way conflicted.
 - **Inline asm must declare implicit flag writes.** `s_add_u32` needs an `"scc"` clobber. Without
   it the scheduler moved a loop compare across the asm and the loop ran once.
 - **Vectorizing shared reads is not always faster.** A K-contiguous `float4` layout on the fp32

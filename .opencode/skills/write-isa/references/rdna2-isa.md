@@ -229,6 +229,11 @@ bank 0 with different addresses. The read crossbar handles an arbitrary permutat
 LDS **writes are banked**: the same stride-32 pattern costs 4.4x. Do not waste time padding a
 read-only tile; do avoid same-bank write patterns.
 
+This was measured the hard way on the fp16 GEMM. Widening the shared reads to `ds_read2_b64`
+required a 16-byte-aligned tile pitch (24 halves instead of 18), which changed the transposed B
+stores from 4-way to 32-way bank conflicts. The kernel fell from 8.52 to 4.99 TFLOP/s even though
+the read path got shorter. Check the store pattern before changing a shared pitch for a wider read.
+
 The 34-cycle chain is the real load-to-use number including the loop and the scoreboard wait. A
 `ds_read_b128` costs 10 more cycles of latency but moves 4x the data at 1.9x the issue cost, so tile
 loads should use 128-bit reads where the layout allows it.
