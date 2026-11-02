@@ -76,6 +76,35 @@ namespace {
         CheckRelative(host, actual, 2e-2);
     }
 
+    void RunSmallMagnitudeRoundTrip(const unsigned int seed) {
+        using namespace ROCmKernels::Kernels;
+
+        const std::vector<float> host = ROCmKernels::Tests::RandomValues<float>(kQ8Block, seed, -1.0e-6f, 1.0e-6f);
+
+        ROCmKernels::DeviceBuffer<float> deviceInput(kQ8Block);
+        ROCmKernels::DeviceBuffer<BlockQ8_0> deviceBlocks(1);
+        ROCmKernels::DeviceBuffer<float> deviceOutput(kQ8Block);
+        deviceInput.CopyFromHost(host.data(), host.size());
+
+        QuantizeQ8_0(deviceInput.Data(), deviceBlocks.Data(), kQ8Block);
+        DequantizeQ8_0(deviceBlocks.Data(), deviceOutput.Data(), kQ8Block);
+        ROCMKERNELS_HIP_CHECK(hipDeviceSynchronize());
+
+        std::vector<BlockQ8_0> blocks(1);
+        std::vector<float> actual(kQ8Block);
+        deviceBlocks.CopyToHost(blocks.data(), blocks.size());
+        deviceOutput.CopyToHost(actual.data(), actual.size());
+
+        const float storedScale = __half2float(blocks[0].scale);
+        REQUIRE(storedScale > 0.0f);
+        CHECK(std::any_of(actual.begin(), actual.end(), [](const float value) { return value != 0.0f; }));
+
+        for (int index = 0; index < kQ8Block; ++index) {
+            INFO("index " << index << " expected " << host[index] << " got " << actual[index]);
+            CHECK(std::abs(actual[index] - host[index]) <= storedScale);
+        }
+    }
+
     void RunZeroBlock() {
         using namespace ROCmKernels::Kernels;
 
@@ -156,6 +185,7 @@ namespace {
 TEST_CASE("Q8_0 quantize and dequantize round trip", "[generic][quantized]") {
     SECTION("32 elements") { RunRoundTrip(32, 1101); }
     SECTION("128 elements") { RunRoundTrip(128, 1201); }
+    SECTION("small magnitude block") { RunSmallMagnitudeRoundTrip(1301); }
     SECTION("zero block") { RunZeroBlock(); }
 }
 

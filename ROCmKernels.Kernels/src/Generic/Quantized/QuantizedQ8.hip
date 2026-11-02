@@ -16,6 +16,8 @@ namespace {
     constexpr int kWarpsPerBlock = 8;
     constexpr int kThreads = kWarpSize * kWarpsPerBlock;
     constexpr int kDequantizeThreads = 256;
+    // Smallest positive fp16 scale, used when a nonzero block would otherwise round to zero.
+    constexpr float kMinimumScale = 5.9604644775390625e-8f;
 
     __device__ __forceinline__ float warp_sum(float value) {
         #pragma unroll
@@ -43,12 +45,18 @@ namespace {
         if (block >= blocks) return;
 
         const float value = input[block * kQ8Block + lane];
-        const float scale = warp_max(fabsf(value)) / 127.0f;
-        const float inverse = scale > 0.0f ? 1.0f / scale : 0.0f;
-        const int quantized = static_cast<int>(roundf(value * inverse));
+        const float maximum = warp_max(fabsf(value));
+        __half scale = __float2half_rn(maximum / 127.0f);
+        if (maximum > 0.0f && __half2float(scale) == 0.0f) scale = __float2half_rn(kMinimumScale);
+
+        // Quantize against the stored scale so dequantization reproduces the block.
+        const float storedScale = __half2float(scale);
+        const float inverse = storedScale > 0.0f ? 1.0f / storedScale : 0.0f;
+        int quantized = static_cast<int>(roundf(value * inverse));
+        quantized = quantized > 127 ? 127 : (quantized < -127 ? -127 : quantized);
 
         BlockQ8_0 &destination = output[block];
-        if (lane == 0) destination.scale = __float2half_rn(scale);
+        if (lane == 0) destination.scale = scale;
         destination.values[lane] = static_cast<std::int8_t>(quantized);
     }
 

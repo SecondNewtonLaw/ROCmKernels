@@ -76,6 +76,8 @@ namespace {
                                         sizeof(ROCmKernels::Kernels::BlockQ8_0);
         const std::uint64_t vectorBytes = static_cast<std::uint64_t>(kColumns) * sizeof(T);
         const std::uint64_t bytesMoved = weightBytes + inputBytes + vectorBytes;
+        // The unique footprint counts both vector-sized buffers, bias and output.
+        const std::uint64_t bytesTouched = weightBytes + inputBytes + 2 * vectorBytes;
 
         return ROCmKernels::Benchmark::Case{
             .name = std::string("Q8_0 GEMV ") + TypeName<T>() + " c4096 k4096",
@@ -86,7 +88,7 @@ namespace {
                             state->output.Data(), kColumns, kInner, ROCmKernels::Kernels::DTypeOf<T>::value, stream);
                 },
             .bytesMoved = bytesMoved,
-            .bytesTouched = bytesMoved,
+            .bytesTouched = bytesTouched,
             .operations = 2 * static_cast<std::uint64_t>(kColumns) * kInner,
         };
     }
