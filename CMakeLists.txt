@@ -123,7 +123,7 @@ target_link_libraries(ROCmKernels.Kernels PUBLIC ROCmKernels.Common)
 rocmkernels_apply_compile_options(ROCmKernels.Kernels)
 
 # Same sources as a DLL, so a training loop can call the kernels through ctypes.
-option(BUILD_SHARED_KERNELS "Build ROCmKernels.Kernels.Shared for ctypes harnesses." OFF)
+option(BUILD_SHARED_KERNELS "Build ROCmKernels.Kernels.Shared for ctypes harnesses." ON)
 if (BUILD_SHARED_KERNELS)
     add_library(ROCmKernels.Kernels.Shared SHARED
             ${ROCMKERNELS_KERNEL_SOURCES}
@@ -251,3 +251,4 @@ if (BUILD_ISA_BENCH)
     rocmkernels_apply_compile_options(ROCmKernels.IsaBench)
     rocmkernels_deploy_hip_runtime(ROCmKernels.IsaBench)
 endif ()
+

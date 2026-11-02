@@ -64,6 +64,22 @@ The flash kernel in `src/Attention/AttentionFlash32.h` is the measured result of
 
 Cases live next to the harness in `ROCmKernels.Benchmark/src`. Register a case, set `bytesMoved`, `bytesTouched` and `operations`, and the columns follow.
 
+### Calling the kernels from Python
+
+`BUILD_SHARED_KERNELS` is on by default and builds `ROCmKernels.Kernels.Shared.dll`
+next to the benchmark executable, with the same `extern "C"` entry points as the
+static library. A training loop can bind them with `ctypes` and call them on its
+own torch tensors, which is how the step benchmarks in `docs/torch-gemm-reference.md`
+were run. `tools/TorchCompare/compare_ops.py` is the binding pattern: every
+function takes raw pointers, row/column counts, a `DType` byte and a stream.
+
+The exported surface covers the optimizer (`muon_fp32_prepare`, `muon_fp32_gram`,
+`muon_fp32_make_b`, `muon_fp32_multiply`, `muon_fp32_apply`, `adamw_multi`), the
+norms (`layernorm_scale_add_forward/backward`, `rms_norm_forward`), the losses
+(`cross_entropy_fp32_forward/backward`, `softmax_forward`), the linear family
+(`linear_act_fast`, `linear_fast`, `linear_act_nt`, `linear_nt`), the fused FFN
+(`ffn_up_silu_down`) and the attention and embedding kernels.
+
 ### Generic kernels
 
 `ROCmKernels.Kernels/src/Generic` holds dtype-generic kernels. Storage is selected at runtime with `ROCmKernels::Kernels::DType` (`Float32` or `Float16`); every kernel accumulates in fp32 and writes the selected type. `DType.hpp` provides the scalar and pair loads/stores. New files in `src/Generic`, `Tests/Generic` and `Benchmark/src/Generic` are globbed by CMake, so a kernel package is four files: header, `.hip`, test, benchmark.
@@ -232,6 +248,7 @@ An installation can compile gfx1031 code and still fail to detect the card. The 
 | `BUILD_PROFILING_TOOLS` | `OFF` | Build `OpenClProbe` for the profiling skill |
 | `BUILD_ISA_BENCH` | `ON` | Build the RDNA2 instruction microbenchmark |
 | `ROCMKERNELS_EMIT_ASSEMBLY` | `ON` | Provide the `ROCmKernels.Assembly` target |
+
 
 
 
