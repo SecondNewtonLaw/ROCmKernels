@@ -126,6 +126,22 @@ case("o linear 8192x128 -> 128",
      lambda: F.linear(x, w_o),
      lambda: linear_plain(ptr(x), ptr(w_ot), None, ptr(y), P_, D, D, FP16, stream), 24)
 
+# ------------------------------------------------------------------ FFN unfused pair, full and 128-row tiles
+h1 = torch.empty(8192, E, device=DEV, dtype=torch.float16)
+y1 = torch.empty(8192, D, device=DEV, dtype=torch.float16)
+case("ffn up full 8192x128 -> 8192",
+     lambda: F.silu(F.linear(x, w1)),
+     lambda: linear_act(ptr(x), ptr(w1t), None, ptr(h1), 8192, E, D, FP16, stream), 1)
+case("ffn down full 8192x8192 -> 128",
+     lambda: F.linear(h1, w2),
+     lambda: linear_plain(ptr(h1), ptr(w2t), None, ptr(y1), 8192, D, E, FP16, stream), 1)
+case("ffn up 128-row tile",
+     lambda: F.silu(F.linear(x[:128], w1)),
+     lambda: linear_act(ptr(x), ptr(w1t), None, ptr(h1), 128, E, D, FP16, stream), 1)
+case("ffn down 128-row tile",
+     lambda: F.linear(h1[:128], w2),
+     lambda: linear_plain(ptr(h1), ptr(w2t), None, ptr(y1), 128, D, E, FP16, stream), 1)
+
 # ------------------------------------------------------------------ layer norm block op
 res = torch.randn(P_, D, device=DEV, dtype=torch.float16)
 ls = torch.randn(D, device=DEV, dtype=torch.float16)
@@ -177,4 +193,5 @@ case("w2 linear (repeat)",
      lambda: linear_plain(ptr(h), ptr(w2t), None, ptr(y), P_, D, E, FP16, stream), 24)
 
 print(f"\nwrote {OUT}")
+
 
