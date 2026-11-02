@@ -5,6 +5,7 @@
 
 #include "../TestSupport.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <type_traits>
@@ -38,7 +39,7 @@ namespace {
     }
 
     template<typename T> void RunFastLinearCase(const int rows, const int columns, const int inner, const bool withBias,
-            const unsigned int seed) {
+            const unsigned int seed, const int pointerOffset = 0) {
         const std::size_t inputElements = static_cast<std::size_t>(rows) * inner;
         const std::size_t weightElements = static_cast<std::size_t>(inner) * columns;
         const std::size_t outputElements = static_cast<std::size_t>(rows) * columns;
@@ -67,17 +68,22 @@ namespace {
             }
         }
 
-        ROCmKernels::DeviceBuffer<T> deviceInput(inputElements);
-        ROCmKernels::DeviceBuffer<T> deviceWeight(weightElements);
+        std::vector<T> paddedInput(inputElements + pointerOffset);
+        std::vector<T> paddedWeight(weightElements + pointerOffset);
+        std::copy(storageInput.begin(), storageInput.end(), paddedInput.begin() + pointerOffset);
+        std::copy(storageWeight.begin(), storageWeight.end(), paddedWeight.begin() + pointerOffset);
+
+        ROCmKernels::DeviceBuffer<T> deviceInput(paddedInput.size());
+        ROCmKernels::DeviceBuffer<T> deviceWeight(paddedWeight.size());
         ROCmKernels::DeviceBuffer<T> deviceBias(withBias ? columns : 0);
         ROCmKernels::DeviceBuffer<T> deviceOutput(outputElements);
 
-        deviceInput.CopyFromHost(storageInput.data(), storageInput.size());
-        deviceWeight.CopyFromHost(storageWeight.data(), storageWeight.size());
+        deviceInput.CopyFromHost(paddedInput.data(), paddedInput.size());
+        deviceWeight.CopyFromHost(paddedWeight.data(), paddedWeight.size());
         if (withBias) deviceBias.CopyFromHost(storageBias.data(), storageBias.size());
 
-        ROCmKernels::Kernels::LinearActFast(deviceInput.Data(), deviceWeight.Data(), withBias ? deviceBias.Data() : nullptr, deviceOutput.Data(),
-                rows, columns, inner, ROCmKernels::Kernels::DTypeOf<T>::value);
+        ROCmKernels::Kernels::LinearActFast(deviceInput.Data() + pointerOffset, deviceWeight.Data() + pointerOffset,
+                withBias ? deviceBias.Data() : nullptr, deviceOutput.Data(), rows, columns, inner, ROCmKernels::Kernels::DTypeOf<T>::value);
         ROCMKERNELS_HIP_CHECK(hipDeviceSynchronize());
 
         std::vector<T> actual(outputElements);
@@ -95,6 +101,7 @@ TEST_CASE("LinearActFast matches the reference", "[generic][linear][fast]") {
         SECTION("full tile with bias") { RunFastLinearCase<float>(64, 64, 16, true, 103); }
         SECTION("full tile without bias") { RunFastLinearCase<float>(64, 64, 16, false, 104); }
         SECTION("multiple tiles with tails") { RunFastLinearCase<float>(65, 67, 31, true, 105); }
+        SECTION("offset pointer with vectorizable strides") { RunFastLinearCase<float>(96, 96, 16, true, 106, 1); }
     }
 
     SECTION("fp16") {
@@ -103,5 +110,6 @@ TEST_CASE("LinearActFast matches the reference", "[generic][linear][fast]") {
         SECTION("full tile with bias") { RunFastLinearCase<__half>(64, 64, 16, true, 203); }
         SECTION("full tile without bias") { RunFastLinearCase<__half>(64, 64, 16, false, 204); }
         SECTION("multiple tiles with tails") { RunFastLinearCase<__half>(65, 67, 31, true, 205); }
+        SECTION("offset pointer with vectorizable strides") { RunFastLinearCase<__half>(96, 96, 16, true, 206, 1); }
     }
 }
