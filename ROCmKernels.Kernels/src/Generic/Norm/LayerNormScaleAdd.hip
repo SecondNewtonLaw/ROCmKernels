@@ -11,10 +11,18 @@ namespace {
     // Rows up to this width keep the fused x + scale*z value in shared memory,
     // so the normalization pass does not repeat the three global loads.
     constexpr int kStageColumns = 4096;
+    // Enough blocks to fill 36 CUs a few times over while each wave still covers several rows.
+    constexpr int kBackwardBlocks = 144;
 
     __device__ __forceinline__ float wave_sum(float value) {
         #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1) value += __shfl_down(value, offset, 32);
+        return value;
+    }
+
+    __device__ __forceinline__ float wave_all_sum(float value) {
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) value += __shfl_xor(value, offset, 32);
         return value;
     }
 
@@ -43,6 +51,52 @@ namespace {
         __syncthreads();
         first = scratch[0];
         second = scratch[kWarps];
+    }
+
+    // One wave per row while the row fits in registers: no shared memory or barriers, and every wave works on narrow rows.
+    template<typename T, int PerLane>
+    __global__ __launch_bounds__(kThreads) void layernorm_scale_add_forward_wave_kernel(const T *x, const T *z, const T *scale,
+            const T *weight, const T *bias, T *output, float *statistics, const int rows, const int columns, const float epsilon) {
+        const int lane = threadIdx.x % 32;
+        const int row = blockIdx.x * kWarps + threadIdx.x / 32;
+        if (row >= rows) return;
+        const std::size_t base = std::size_t(row) * columns;
+
+        float values[PerLane];
+        float sum = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < PerLane; ++i) {
+            const int column = i * 32 + lane;
+            values[i] = column < columns
+                    ? ROCmKernels::Kernels::LoadScalar(x + base + column) +
+                      ROCmKernels::Kernels::LoadScalar(scale + column) * ROCmKernels::Kernels::LoadScalar(z + base + column)
+                    : 0.0f;
+            sum += values[i];
+        }
+        const float mean = wave_all_sum(sum) / static_cast<float>(columns);
+
+        float squareSum = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < PerLane; ++i) {
+            const float centered = i * 32 + lane < columns ? values[i] - mean : 0.0f;
+            squareSum += centered * centered;
+        }
+        const float rstd = rsqrtf(wave_all_sum(squareSum) / static_cast<float>(columns) + epsilon);
+
+        #pragma unroll
+        for (int i = 0; i < PerLane; ++i) {
+            const int column = i * 32 + lane;
+            if (column >= columns) break;
+            float normalized = (values[i] - mean) * rstd;
+            if (weight != nullptr) normalized *= ROCmKernels::Kernels::LoadScalar(weight + column);
+            if (bias != nullptr) normalized += ROCmKernels::Kernels::LoadScalar(bias + column);
+            ROCmKernels::Kernels::StoreScalar(output + base + column, normalized);
+        }
+
+        if (lane == 0) {
+            statistics[row * 2] = mean;
+            statistics[row * 2 + 1] = rstd;
+        }
     }
 
     template<typename T>
@@ -120,55 +174,177 @@ namespace {
         }
     }
 
-    template<typename T>
+    // Waves stride over rows and keep the parameter gradients in registers, so the global atomics drop from three per
+    // element to three per column per block.
+    template<typename T, int PerLane>
+    __global__ __launch_bounds__(kThreads) void layernorm_scale_add_backward_wave_kernel(const T *x, const T *z, const T *scale,
+            const T *weight, const float *statistics, const T *upstream, T *gradientX, T *gradientZ, float *gradientScale,
+            float *gradientWeight, float *gradientBias, const int rows, const int columns) {
+        __shared__ float partial[3][PerLane * 32];
+        for (int index = threadIdx.x; index < 3 * PerLane * 32; index += kThreads) (&partial[0][0])[index] = 0.0f;
+        __syncthreads();
+
+        const int lane = threadIdx.x % 32;
+        float scales[PerLane], weights[PerLane];
+        float scaleGradient[PerLane] = {}, weightGradient[PerLane] = {}, biasGradient[PerLane] = {};
+        #pragma unroll
+        for (int i = 0; i < PerLane; ++i) {
+            const int column = i * 32 + lane;
+            scales[i] = column < columns ? ROCmKernels::Kernels::LoadScalar(scale + column) : 0.0f;
+            weights[i] = weight != nullptr && column < columns ? ROCmKernels::Kernels::LoadScalar(weight + column) : 1.0f;
+        }
+
+        for (int row = blockIdx.x * kWarps + threadIdx.x / 32; row < rows; row += gridDim.x * kWarps) {
+            const std::size_t base = std::size_t(row) * columns;
+            const float mean = statistics[row * 2];
+            const float rstd = statistics[row * 2 + 1];
+
+            float normalized[PerLane], weighted[PerLane], zValues[PerLane];
+            float plainSum = 0.0f;
+            float centeredSum = 0.0f;
+            #pragma unroll
+            for (int i = 0; i < PerLane; ++i) {
+                const int column = i * 32 + lane;
+                normalized[i] = weighted[i] = zValues[i] = 0.0f;
+                if (column >= columns) continue;
+                zValues[i] = ROCmKernels::Kernels::LoadScalar(z + base + column);
+                normalized[i] = (ROCmKernels::Kernels::LoadScalar(x + base + column) + scales[i] * zValues[i] - mean) * rstd;
+                const float dy = ROCmKernels::Kernels::LoadScalar(upstream + base + column);
+                weighted[i] = dy * weights[i];
+                plainSum += weighted[i];
+                centeredSum += weighted[i] * normalized[i];
+                weightGradient[i] += dy * normalized[i];
+                biasGradient[i] += dy;
+            }
+            const float plainMean = wave_all_sum(plainSum) / static_cast<float>(columns);
+            const float centeredMean = wave_all_sum(centeredSum) / static_cast<float>(columns);
+
+            #pragma unroll
+            for (int i = 0; i < PerLane; ++i) {
+                const int column = i * 32 + lane;
+                if (column >= columns) break;
+                const float ds = rstd * (weighted[i] - plainMean - normalized[i] * centeredMean);
+                ROCmKernels::Kernels::StoreScalar(gradientX + base + column, ds);
+                ROCmKernels::Kernels::StoreScalar(gradientZ + base + column, ds * scales[i]);
+                scaleGradient[i] += ds * zValues[i];
+            }
+        }
+
+        #pragma unroll
+        for (int i = 0; i < PerLane; ++i) {
+            const int column = i * 32 + lane;
+            if (column >= columns) break;
+            atomicAdd(&partial[0][column], scaleGradient[i]);
+            atomicAdd(&partial[1][column], weightGradient[i]);
+            atomicAdd(&partial[2][column], biasGradient[i]);
+        }
+        __syncthreads();
+        for (int column = threadIdx.x; column < columns; column += kThreads) {
+            if (gradientScale != nullptr) atomicAdd(gradientScale + column, partial[0][column]);
+            if (gradientWeight != nullptr) atomicAdd(gradientWeight + column, partial[1][column]);
+            if (gradientBias != nullptr) atomicAdd(gradientBias + column, partial[2][column]);
+        }
+    }
+
+    // PerThread > 0: blocks stride over rows and keep parameter gradients in registers; 0: one block per row with per-element atomics.
+    template<typename T, int PerThread>
     __global__ void layernorm_scale_add_backward_kernel(const T *x, const T *z, const T *scale, const T *weight, const float *statistics,
             const T *upstream, T *gradientX, T *gradientZ, float *gradientScale, float *gradientWeight, float *gradientBias,
-            const int columns) {
+            const int rows, const int columns) {
         __shared__ float scratch[2 * kWarps];
 
-        const std::size_t row = blockIdx.x;
-        const std::size_t base = row * columns;
-        const float mean = statistics[row * 2];
-        const float rstd = statistics[row * 2 + 1];
+        float scaleGradient[PerThread > 0 ? PerThread : 1] = {};
+        float weightGradient[PerThread > 0 ? PerThread : 1] = {};
+        float biasGradient[PerThread > 0 ? PerThread : 1] = {};
 
-        float plainSum = 0.0f;
-        float centeredSum = 0.0f;
-        for (int column = threadIdx.x; column < columns; column += kThreads) {
-            const float value = ROCmKernels::Kernels::LoadScalar(x + base + column) +
-                                ROCmKernels::Kernels::LoadScalar(scale + column) * ROCmKernels::Kernels::LoadScalar(z + base + column);
-            const float normalized = (value - mean) * rstd;
-            float dy = ROCmKernels::Kernels::LoadScalar(upstream + base + column);
-            if (weight != nullptr) dy *= ROCmKernels::Kernels::LoadScalar(weight + column);
-            plainSum += dy;
-            centeredSum += dy * normalized;
+        for (std::size_t row = blockIdx.x; row < static_cast<std::size_t>(rows); row += PerThread > 0 ? gridDim.x : rows) {
+            const std::size_t base = row * columns;
+            const float mean = statistics[row * 2];
+            const float rstd = statistics[row * 2 + 1];
+
+            float plainSum = 0.0f;
+            float centeredSum = 0.0f;
+            for (int column = threadIdx.x; column < columns; column += kThreads) {
+                const float value = ROCmKernels::Kernels::LoadScalar(x + base + column) +
+                                    ROCmKernels::Kernels::LoadScalar(scale + column) * ROCmKernels::Kernels::LoadScalar(z + base + column);
+                const float normalized = (value - mean) * rstd;
+                float dy = ROCmKernels::Kernels::LoadScalar(upstream + base + column);
+                if (weight != nullptr) dy *= ROCmKernels::Kernels::LoadScalar(weight + column);
+                plainSum += dy;
+                centeredSum += dy * normalized;
+            }
+            block_reduce_pair(plainSum, centeredSum, scratch);
+
+            const float plainMean = plainSum / static_cast<float>(columns);
+            const float centeredMean = centeredSum / static_cast<float>(columns);
+
+            // Returns this element's contributions to the scale, weight and bias gradients.
+            const auto backward = [&](const int column, float &scaleTerm, float &weightTerm, float &biasTerm) {
+                const float zValue = ROCmKernels::Kernels::LoadScalar(z + base + column);
+                const float scaleValue = ROCmKernels::Kernels::LoadScalar(scale + column);
+                const float normalized = (ROCmKernels::Kernels::LoadScalar(x + base + column) + scaleValue * zValue - mean) * rstd;
+                const float dy = ROCmKernels::Kernels::LoadScalar(upstream + base + column);
+                float dyWeighted = dy;
+                if (weight != nullptr) dyWeighted *= ROCmKernels::Kernels::LoadScalar(weight + column);
+
+                const float ds = rstd * (dyWeighted - plainMean - normalized * centeredMean);
+                ROCmKernels::Kernels::StoreScalar(gradientX + base + column, ds);
+                ROCmKernels::Kernels::StoreScalar(gradientZ + base + column, ds * scaleValue);
+                scaleTerm = ds * zValue;
+                weightTerm = dy * normalized;
+                biasTerm = dy;
+            };
+
+            if constexpr (PerThread > 0) {
+                #pragma unroll
+                for (int k = 0; k < PerThread; ++k) {
+                    const int column = threadIdx.x + k * kThreads;
+                    if (column >= columns) break;
+                    float scaleTerm, weightTerm, biasTerm;
+                    backward(column, scaleTerm, weightTerm, biasTerm);
+                    scaleGradient[k] += scaleTerm;
+                    weightGradient[k] += weightTerm;
+                    biasGradient[k] += biasTerm;
+                }
+                // block_reduce_pair reuses scratch on the next row.
+                __syncthreads();
+            } else {
+                for (int column = threadIdx.x; column < columns; column += kThreads) {
+                    float scaleTerm, weightTerm, biasTerm;
+                    backward(column, scaleTerm, weightTerm, biasTerm);
+                    if (gradientScale != nullptr) atomicAdd(gradientScale + column, scaleTerm);
+                    if (gradientWeight != nullptr) atomicAdd(gradientWeight + column, weightTerm);
+                    if (gradientBias != nullptr) atomicAdd(gradientBias + column, biasTerm);
+                }
+            }
         }
-        block_reduce_pair(plainSum, centeredSum, scratch);
 
-        const float plainMean = plainSum / static_cast<float>(columns);
-        const float centeredMean = centeredSum / static_cast<float>(columns);
-
-        for (int column = threadIdx.x; column < columns; column += kThreads) {
-            const float value = ROCmKernels::Kernels::LoadScalar(x + base + column) +
-                                ROCmKernels::Kernels::LoadScalar(scale + column) * ROCmKernels::Kernels::LoadScalar(z + base + column);
-            const float normalized = (value - mean) * rstd;
-            const float dy = ROCmKernels::Kernels::LoadScalar(upstream + base + column);
-            float dyWeighted = dy;
-            if (weight != nullptr) dyWeighted *= ROCmKernels::Kernels::LoadScalar(weight + column);
-
-            const float ds = rstd * (dyWeighted - plainMean - normalized * centeredMean);
-            ROCmKernels::Kernels::StoreScalar(gradientX + base + column, ds);
-            ROCmKernels::Kernels::StoreScalar(gradientZ + base + column, ds * ROCmKernels::Kernels::LoadScalar(scale + column));
-
-            // Parameter gradients stay fp32; one atomically accumulated row contribution per column.
-            if (gradientScale != nullptr) atomicAdd(gradientScale + column, ds * ROCmKernels::Kernels::LoadScalar(z + base + column));
-            if (gradientWeight != nullptr) atomicAdd(gradientWeight + column, dy * normalized);
-            if (gradientBias != nullptr) atomicAdd(gradientBias + column, dy);
+        if constexpr (PerThread > 0) {
+            #pragma unroll
+            for (int k = 0; k < PerThread; ++k) {
+                const int column = threadIdx.x + k * kThreads;
+                if (column >= columns) break;
+                if (gradientScale != nullptr) atomicAdd(gradientScale + column, scaleGradient[k]);
+                if (gradientWeight != nullptr) atomicAdd(gradientWeight + column, weightGradient[k]);
+                if (gradientBias != nullptr) atomicAdd(gradientBias + column, biasGradient[k]);
+            }
         }
     }
 
     template<typename T>
     int launch_forward(const void *x, const void *z, const void *scale, const void *weight, const void *bias, void *output, float *statistics,
             const int rows, const int columns, const float epsilon, hipStream_t stream) {
+        const auto wave = [&](auto kernel) {
+            hipLaunchKernelGGL(kernel, dim3((rows + kWarps - 1) / kWarps), dim3(kThreads), 0, stream, static_cast<const T *>(x),
+                    static_cast<const T *>(z), static_cast<const T *>(scale), static_cast<const T *>(weight), static_cast<const T *>(bias),
+                    static_cast<T *>(output), statistics, rows, columns, epsilon);
+            return hipGetLastError();
+        };
+        if (columns <= 128) return wave(layernorm_scale_add_forward_wave_kernel<T, 4>);
+        if (columns <= 256) return wave(layernorm_scale_add_forward_wave_kernel<T, 8>);
+        // Measured: at 1024 fp32 columns one wave per row is slower than the block-per-row kernel.
+        if (columns <= 512) return wave(layernorm_scale_add_forward_wave_kernel<T, 16>);
+
         if (columns <= kStageColumns) {
             hipLaunchKernelGGL((layernorm_scale_add_forward_staged_kernel<T>), dim3(rows), dim3(kThreads), 0, stream,
                     static_cast<const T *>(x), static_cast<const T *>(z), static_cast<const T *>(scale), static_cast<const T *>(weight),
@@ -200,11 +376,27 @@ namespace {
             if (status != hipSuccess) return status;
         }
 
-        hipLaunchKernelGGL((layernorm_scale_add_backward_kernel<T>), dim3(rows), dim3(kThreads), 0, stream,
-                static_cast<const T *>(x), static_cast<const T *>(z), static_cast<const T *>(scale), static_cast<const T *>(weight),
-                statistics, static_cast<const T *>(upstream), static_cast<T *>(gradientX), static_cast<T *>(gradientZ), gradientScale,
-                gradientWeight, gradientBias, columns);
-        return hipGetLastError();
+        const auto wave = [&](auto kernel) {
+            const int blocks = std::min((rows + kWarps - 1) / kWarps, kBackwardBlocks);
+            hipLaunchKernelGGL(kernel, dim3(blocks), dim3(kThreads), 0, stream, static_cast<const T *>(x), static_cast<const T *>(z),
+                    static_cast<const T *>(scale), static_cast<const T *>(weight), statistics, static_cast<const T *>(upstream),
+                    static_cast<T *>(gradientX), static_cast<T *>(gradientZ), gradientScale, gradientWeight, gradientBias, rows, columns);
+            return hipGetLastError();
+        };
+        if (columns <= 128) return wave(layernorm_scale_add_backward_wave_kernel<T, 4>);
+        // Measured: from 512 columns the block kernel below beats one wave per row.
+        if (columns <= 256) return wave(layernorm_scale_add_backward_wave_kernel<T, 8>);
+
+        const auto block = [&](auto kernel, const int blocks) {
+            hipLaunchKernelGGL(kernel, dim3(blocks), dim3(kThreads), 0, stream, static_cast<const T *>(x), static_cast<const T *>(z),
+                    static_cast<const T *>(scale), static_cast<const T *>(weight), statistics, static_cast<const T *>(upstream),
+                    static_cast<T *>(gradientX), static_cast<T *>(gradientZ), gradientScale, gradientWeight, gradientBias, rows, columns);
+            return hipGetLastError();
+        };
+        const int strided = std::min(rows, kBackwardBlocks);
+        if (columns <= 4 * kThreads) return block(layernorm_scale_add_backward_kernel<T, 4>, strided);
+        if (columns <= 8 * kThreads) return block(layernorm_scale_add_backward_kernel<T, 8>, strided);
+        return block(layernorm_scale_add_backward_kernel<T, 0>, rows);
     }
 } // namespace
 
