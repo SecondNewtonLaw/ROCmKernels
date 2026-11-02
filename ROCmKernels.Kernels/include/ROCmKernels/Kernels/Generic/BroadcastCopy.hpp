@@ -24,12 +24,16 @@ extern "C" ROCMKERNELS_EXPORT int fill_forward(void *dst, float value, long long
 
 namespace ROCmKernels::Kernels {
     /// out[r][c] = op(a[r][c], b[...]), where b is [rows][columns], [columns], [rows] or one element.
+    ///
+    /// a may alias out. b is reused across rows, so b must not overlap out; such calls return hipErrorInvalidValue.
     inline void BroadcastBinary(const void *a, const void *b, void *out, const int rows, const int columns, const BinaryOp op,
             const BroadcastMode mode, const DType dtype, hipStream_t stream = nullptr) {
         ROCMKERNELS_HIP_CHECK(broadcast_binary_forward(a, b, out, rows, columns, op, mode, dtype, stream));
     }
 
     /// Copies rows of columns contiguous elements; row strides are in elements and must be at least columns.
+    ///
+    /// src and dst must not overlap.
     inline void Copy2D(const void *src, void *dst, const int rows, const int columns, const int sourceRowStride,
             const int destinationRowStride, const DType dtype, hipStream_t stream = nullptr) {
         ROCMKERNELS_HIP_CHECK(copy_2d_forward(src, dst, rows, columns, sourceRowStride, destinationRowStride, dtype, stream));

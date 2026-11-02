@@ -3,9 +3,18 @@
 
 #include <hip/hip_runtime.h>
 
+#include <cstddef>
+#include <cstdint>
+
 namespace {
     constexpr int kThreads = 256;
     constexpr long long kMaxBlocks = 65535;
+
+    bool RangesOverlap(const void *left, const std::size_t leftBytes, const void *right, const std::size_t rightBytes) {
+        const std::uintptr_t leftBegin = reinterpret_cast<std::uintptr_t>(left);
+        const std::uintptr_t rightBegin = reinterpret_cast<std::uintptr_t>(right);
+        return leftBegin < rightBegin + rightBytes && rightBegin < leftBegin + leftBytes;
+    }
 
     template<ROCmKernels::Kernels::BinaryOp Op>
     __device__ __forceinline__ float Apply(const float a, const float b) {
@@ -28,7 +37,7 @@ namespace {
         const T *aRow = a + rowBase;
         T *outRow = out + rowBase;
 
-        for (int column = threadIdx.x; column < columns; column += blockDim.x) {
+        for (long long column = threadIdx.x; column < columns; column += blockDim.x) {
             long long bIndex = 0;
             if constexpr (Mode == BroadcastMode::None) bIndex = rowBase + column;
             else if constexpr (Mode == BroadcastMode::Row) bIndex = column;
@@ -48,7 +57,7 @@ namespace {
         const T *sourceRow = src + static_cast<long long>(row) * sourceRowStride;
         T *destinationRow = dst + static_cast<long long>(row) * destinationRowStride;
 
-        for (int column = threadIdx.x; column < columns; column += blockDim.x) destinationRow[column] = sourceRow[column];
+        for (long long column = threadIdx.x; column < columns; column += blockDim.x) destinationRow[column] = sourceRow[column];
     }
 
     template<typename T>
@@ -130,7 +139,19 @@ extern "C" ROCMKERNELS_EXPORT int broadcast_binary_forward(const void *a, const 
     using ROCmKernels::Kernels::DType;
 
     if (!a || !b || !out || rows <= 0 || columns <= 0 || (op != BinaryOp::Add && op != BinaryOp::Sub && op != BinaryOp::Mul && op != BinaryOp::Div) ||
-        (mode != BroadcastMode::None && mode != BroadcastMode::Row && mode != BroadcastMode::Column && mode != BroadcastMode::Scalar))
+        (mode != BroadcastMode::None && mode != BroadcastMode::Row && mode != BroadcastMode::Column && mode != BroadcastMode::Scalar) ||
+        (dtype != DType::Float32 && dtype != DType::Float16))
+        return hipErrorInvalidValue;
+
+    const long long outputElements = static_cast<long long>(rows) * columns;
+    long long operandElements = 1;
+    if (mode == BroadcastMode::None) operandElements = outputElements;
+    else if (mode == BroadcastMode::Row) operandElements = columns;
+    else if (mode == BroadcastMode::Column) operandElements = rows;
+    const std::size_t elementSize = dtype == DType::Float16 ? sizeof(__half) : sizeof(float);
+
+    // b is reused across rows, so an overlapping output would make the result depend on block ordering.
+    if (RangesOverlap(b, static_cast<std::size_t>(operandElements) * elementSize, out, static_cast<std::size_t>(outputElements) * elementSize))
         return hipErrorInvalidValue;
 
     switch (dtype) {
@@ -166,8 +187,9 @@ extern "C" ROCMKERNELS_EXPORT int copy_2d_forward(const void *src, void *dst, in
 extern "C" ROCMKERNELS_EXPORT int fill_forward(void *dst, float value, long long elements, ROCmKernels::Kernels::DType dtype, hipStream_t stream) {
     using ROCmKernels::Kernels::DType;
 
-    if (!dst || elements < 0 || (dtype != DType::Float32 && dtype != DType::Float16)) return hipErrorInvalidValue;
+    if (elements < 0 || (dtype != DType::Float32 && dtype != DType::Float16)) return hipErrorInvalidValue;
     if (elements == 0) return hipSuccess;
+    if (!dst) return hipErrorInvalidValue;
 
     switch (dtype) {
         case DType::Float32:

@@ -231,3 +231,22 @@ TEST_CASE("Fill writes every element", "[generic][fill]") {
     SECTION("fp32") { RunFill<float>(401); }
     SECTION("fp16") { RunFill<__half>(402); }
 }
+
+TEST_CASE("Broadcast binary and fill validate their arguments", "[generic][validation]") {
+    using ROCmKernels::Kernels::BinaryOp;
+    using ROCmKernels::Kernels::BroadcastMode;
+    using ROCmKernels::Kernels::DType;
+
+    SECTION("zero-element fill succeeds without a destination") {
+        CHECK(fill_forward(nullptr, 0.5f, 0, DType::Float32, nullptr) == hipSuccess);
+        CHECK(fill_forward(nullptr, 0.5f, 0, DType::Float16, nullptr) == hipSuccess);
+    }
+
+    SECTION("broadcast rejects a second operand aliased with the output") {
+        const float a = 1.0f;
+        float b = 2.0f;
+
+        CHECK(broadcast_binary_forward(&a, &b, &b, 1, 1, BinaryOp::Add, BroadcastMode::Scalar, DType::Float32, nullptr) ==
+                hipErrorInvalidValue);
+    }
+}
