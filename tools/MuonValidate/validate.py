@@ -149,10 +149,43 @@ def check(rows, columns, count, seed):
     return parameter_error
 
 
+def check_oracle(root):
+    """Compare the torch reference in this file against retriever.reactive.MuonNS."""
+    import sys
+
+    sys.path.insert(0, root)
+    from retriever.reactive import MuonNS
+
+    for rows, columns, seed in ((128, 128, 0), (8192, 128, 1), (128, 128, 2)):
+        torch.manual_seed(seed)
+        parameter = torch.randn(rows, columns) * 0.02
+        gradient = torch.randn(rows, columns)
+        buffer = torch.zeros(rows, columns)
+        expected, expected_buffer, _ = reference(
+            type("Group", (), {"rows": rows, "columns": columns})(),
+            (parameter.unsqueeze(0), gradient.unsqueeze(0), buffer.unsqueeze(0)))
+        expected, expected_buffer = expected[0], expected_buffer[0]
+
+        live = torch.nn.Parameter(parameter.clone())
+        live.grad = gradient.clone()
+        optimizer = MuonNS([{"params": [live]}], lr=LR, weight_decay=WEIGHT_DECAY, momentum=MOMENTUM)
+        state = optimizer.state[live]
+        state["momentum"] = buffer.clone()
+        state["g2"] = torch.zeros((), device=live.device)
+        optimizer.step()
+
+        parameter_error = ((expected - live.detach()).norm() / live.detach().norm()).item()
+        buffer_error = ((expected_buffer - state["momentum"]).norm() / state["momentum"].norm()).item()
+        print(f"oracle {rows}x{columns}: reference vs reactive.MuonNS  param {parameter_error:.2e}  buffer {buffer_error:.2e}")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--shapes", default="128x128,384x128,8192x128,128x8192,256x128,128x1024")
+    parser.add_argument("--oracle", default="", help="path to the repo containing retriever/reactive.py")
     args = parser.parse_args()
+    if args.oracle:
+        check_oracle(args.oracle)
     worst = 0.0
     for shape in args.shapes.split(","):
         rows, columns = (int(value) for value in shape.split("x"))
@@ -163,6 +196,8 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
 
 
 
