@@ -489,7 +489,8 @@ namespace {
         }
     }
 
-    template<int Rows, int Columns, int TileRows, int TileColumns, int KTile, bool Activate, bool FloatOut, bool EmitS>
+    // TransA reads input as input[k][row], so dW = dy^T @ x needs no transpose of dy.
+    template<int Rows, int Columns, int TileRows, int TileColumns, int KTile, bool Activate, bool FloatOut, bool EmitS, bool TransA = false>
     __global__ __launch_bounds__(kThreads) void linear_act_fast_half_wide_kernel(const __half *input, const __half *weight, const __half *bias,
             void *output, __half *sigmoidOut, const int rows, const int columns, const int inner) {
         __shared__ __half tileA[Rows][KTile + 2];
@@ -498,13 +499,14 @@ namespace {
         const int tid = threadIdx.y * kThreadsX + threadIdx.x;
         const int rowBase = blockIdx.y * Rows;
         const int columnBase = blockIdx.x * Columns;
-        const bool vectorizedA = Vectorizable(input, inner);
+        const bool vectorizedA = Vectorizable(input, TransA ? rows : inner);
         const bool vectorizedB = Vectorizable(weight, columns);
 
         float accumulators[TileRows][TileColumns] = {};
 
         for (int kBase = 0; kBase < inner; kBase += KTile) {
-            load_a_half_wide<Rows, KTile, KTile + 2>(input, tileA, rowBase, kBase, rows, inner, vectorizedA, tid);
+            if constexpr (TransA) load_b_half_wide<Rows, KTile, KTile + 2>(input, tileA, rowBase, kBase, rows, inner, vectorizedA, tid);
+            else load_a_half_wide<Rows, KTile, KTile + 2>(input, tileA, rowBase, kBase, rows, inner, vectorizedA, tid);
             load_b_half_wide<Columns, KTile, KTile + 2>(weight, tileB, columnBase, kBase, columns, inner, vectorizedB, tid);
             __syncthreads();
 
@@ -643,6 +645,21 @@ extern "C" ROCMKERNELS_EXPORT int linear_fast_fp32_out(const void *input, const 
         hipLaunchKernelGGL((linear_act_fast_half_wide_kernel<64, 128, 4, 8, 32, false, true, false>), grid, dim3(kThreadsX, kThreadsY), 0, stream,
                 static_cast<const __half *>(input), static_cast<const __half *>(weight), static_cast<const __half *>(bias), output, nullptr, rows,
                 columns, inner);
+    }
+    return hipGetLastError();
+}
+
+extern "C" ROCMKERNELS_EXPORT int linear_tn_fp32_out(const void *a, const void *b, void *output, int rows, int columns, int inner,
+        hipStream_t stream) {
+    if (!a || !b || !output || rows <= 0 || columns <= 0 || inner <= 0) return hipErrorInvalidValue;
+    if (columns > 128) {
+        const dim3 grid((columns + 63) / 64, (rows + 127) / 128);
+        hipLaunchKernelGGL((linear_act_fast_half_wide_kernel<128, 64, 8, 4, 64, false, true, false, true>), grid, dim3(kThreadsX, kThreadsY), 0,
+                stream, static_cast<const __half *>(a), static_cast<const __half *>(b), nullptr, output, nullptr, rows, columns, inner);
+    } else {
+        const dim3 grid((columns + 127) / 128, (rows + 63) / 64);
+        hipLaunchKernelGGL((linear_act_fast_half_wide_kernel<64, 128, 4, 8, 32, false, true, false, true>), grid, dim3(kThreadsX, kThreadsY), 0,
+                stream, static_cast<const __half *>(a), static_cast<const __half *>(b), nullptr, output, nullptr, rows, columns, inner);
     }
     return hipGetLastError();
 }

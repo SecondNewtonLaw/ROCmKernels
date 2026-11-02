@@ -19,6 +19,9 @@ extern "C" ROCMKERNELS_EXPORT int linear_act_fast_s(const void *input, const voi
         int rows, int columns, int inner, hipStream_t stream);
 extern "C" ROCMKERNELS_EXPORT int linear_fast_fp32_out(const void *input, const void *weight, const void *bias, void *output, int rows,
         int columns, int inner, hipStream_t stream);
+// fp16 in, fp32 out: output[r][c] = sum_k a[k][r] * b[k][c]. The weight gradient dW = dy^T @ x with dy read in place.
+extern "C" ROCMKERNELS_EXPORT int linear_tn_fp32_out(const void *a, const void *b, void *output, int rows, int columns, int inner,
+        hipStream_t stream);
 extern "C" ROCMKERNELS_EXPORT int linear_nt(const void *input, const void *weight, const void *bias, void *output, int rows, int columns,
         int inner, ROCmKernels::Kernels::DType dtype, hipStream_t stream);
 

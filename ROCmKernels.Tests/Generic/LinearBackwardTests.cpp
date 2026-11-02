@@ -1,6 +1,7 @@
 #include <ROCmKernels/Common/DeviceBuffer.hpp>
 #include <hip/hip_fp16.h>
 #include <algorithm>
+#include <ROCmKernels/Kernels/Generic/LinearActFast.hpp>
 #include <ROCmKernels/Kernels/Generic/LinearBackward.hpp>
 
 #include <catch2/catch_test_macros.hpp>
@@ -91,6 +92,40 @@ TEST_CASE("SiLU backward and bias gradient match the reference", "[generic][line
         worstBias = std::max(worstBias, std::abs(static_cast<double>(actualDbias[column]) - expected));
     }
     CHECK(worstBias < 2e-2);
+}
+
+TEST_CASE("TN linear with fp32 output matches the reference", "[generic][linear]") {
+    constexpr int inner = 200;
+    // Both tile configurations, with row and column tails.
+    for (const auto [rows, columns] : {std::pair{136, 72}, std::pair{72, 200}}) {
+        const std::vector<float> hostA = ROCmKernels::Tests::RandomValues<float>(inner * rows, 51, -1.0f, 1.0f);
+        const std::vector<float> hostB = ROCmKernels::Tests::RandomValues<float>(inner * columns, 52, -1.0f, 1.0f);
+        std::vector<__half> a(hostA.size()), b(hostB.size());
+        for (std::size_t index = 0; index < a.size(); ++index) a[index] = __float2half_rn(hostA[index]);
+        for (std::size_t index = 0; index < b.size(); ++index) b[index] = __float2half_rn(hostB[index]);
+
+        ROCmKernels::DeviceBuffer<__half> deviceA(a.size());
+        ROCmKernels::DeviceBuffer<__half> deviceB(b.size());
+        ROCmKernels::DeviceBuffer<float> deviceOutput(static_cast<std::size_t>(rows) * columns);
+        deviceA.CopyFromHost(a.data(), a.size());
+        deviceB.CopyFromHost(b.data(), b.size());
+
+        REQUIRE(linear_tn_fp32_out(deviceA.Data(), deviceB.Data(), deviceOutput.Data(), rows, columns, inner, nullptr) == hipSuccess);
+
+        std::vector<float> actual(static_cast<std::size_t>(rows) * columns);
+        deviceOutput.CopyToHost(actual.data(), actual.size());
+
+        double worst = 0.0;
+        for (int row = 0; row < rows; ++row)
+            for (int column = 0; column < columns; ++column) {
+                double expected = 0.0;
+                for (int k = 0; k < inner; ++k)
+                    expected += static_cast<double>(__half2float(a[static_cast<std::size_t>(k) * rows + row])) *
+                                __half2float(b[static_cast<std::size_t>(k) * columns + column]);
+                worst = std::max(worst, std::abs(actual[static_cast<std::size_t>(row) * columns + column] - expected));
+            }
+        CHECK(worst < 1e-3);
+    }
 }
 
 
