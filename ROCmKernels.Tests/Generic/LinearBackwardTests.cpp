@@ -129,3 +129,89 @@ TEST_CASE("TN linear with fp32 output matches the reference", "[generic][linear]
 }
 
 
+
+TEST_CASE("SiLU backward from h and s matches the reference", "[generic][linear]") {
+    constexpr int rows = 128;
+    constexpr int columns = 64;
+
+    const std::vector<float> hostDh = ROCmKernels::Tests::RandomValues<float>(rows * columns, 81, -1.0f, 1.0f);
+    const std::vector<float> hostZ = ROCmKernels::Tests::RandomValues<float>(rows * columns, 82, -4.0f, 4.0f);
+    std::vector<__half> dh(hostDh.size()), h(hostDh.size()), s(hostDh.size());
+    for (std::size_t index = 0; index < hostDh.size(); ++index) {
+        dh[index] = __float2half_rn(hostDh[index]);
+        const float zValue = __half2float(__float2half_rn(hostZ[index]));
+        const float sigmoid = 1.0f / (1.0f + std::exp(-zValue));
+        h[index] = __float2half_rn(zValue * sigmoid);
+        s[index] = __float2half_rn(sigmoid);
+    }
+
+    ROCmKernels::DeviceBuffer<__half> deviceDh(dh.size());
+    ROCmKernels::DeviceBuffer<__half> deviceH(h.size());
+    ROCmKernels::DeviceBuffer<__half> deviceS(s.size());
+    ROCmKernels::DeviceBuffer<__half> deviceDz(dh.size());
+    ROCmKernels::DeviceBuffer<float> deviceDbias(columns);
+    deviceDh.CopyFromHost(dh.data(), dh.size());
+    deviceH.CopyFromHost(h.data(), h.size());
+    deviceS.CopyFromHost(s.data(), s.size());
+
+    ROCmKernels::Kernels::SiluBackwardHsFp16(deviceDh.Data(), deviceH.Data(), deviceS.Data(), deviceDz.Data(), deviceDbias.Data(), rows, columns);
+
+    std::vector<__half> actualDz(dh.size());
+    std::vector<float> actualDbias(columns);
+    deviceDz.CopyToHost(actualDz.data(), actualDz.size());
+    deviceDbias.CopyToHost(actualDbias.data(), actualDbias.size());
+
+    double worst = 0.0, worstBias = 0.0;
+    for (std::size_t index = 0; index < dh.size(); ++index) {
+        const float sigmoid = __half2float(s[index]);
+        const float activation = __half2float(h[index]);
+        const float expected = __half2float(dh[index]) * (sigmoid + activation * (1.0f - sigmoid));
+        worst = std::max(worst, static_cast<double>(std::abs(__half2float(actualDz[index]) - expected)));
+    }
+    for (int column = 0; column < columns; ++column) {
+        double expected = 0.0;
+        for (int row = 0; row < rows; ++row)
+            expected += __half2float(actualDz[static_cast<std::size_t>(row) * columns + column]);
+        worstBias = std::max(worstBias, std::abs(static_cast<double>(actualDbias[column]) - expected));
+    }
+    CHECK(worst < 5e-3);
+    CHECK(worstBias < 2e-2);
+}
+
+TEST_CASE("SiLU backward from h and s handles a tail", "[generic][linear]") {
+    constexpr int rows = 127;
+    constexpr int columns = 63;
+
+    const std::vector<float> hostDh = ROCmKernels::Tests::RandomValues<float>(rows * columns, 91, -1.0f, 1.0f);
+    const std::vector<float> hostZ = ROCmKernels::Tests::RandomValues<float>(rows * columns, 92, -4.0f, 4.0f);
+    std::vector<__half> dh(hostDh.size()), h(hostDh.size()), s(hostDh.size());
+    for (std::size_t index = 0; index < hostDh.size(); ++index) {
+        dh[index] = __float2half_rn(hostDh[index]);
+        const float zValue = __half2float(__float2half_rn(hostZ[index]));
+        const float sigmoid = 1.0f / (1.0f + std::exp(-zValue));
+        h[index] = __float2half_rn(zValue * sigmoid);
+        s[index] = __float2half_rn(sigmoid);
+    }
+
+    ROCmKernels::DeviceBuffer<__half> deviceDh(dh.size());
+    ROCmKernels::DeviceBuffer<__half> deviceH(h.size());
+    ROCmKernels::DeviceBuffer<__half> deviceS(s.size());
+    ROCmKernels::DeviceBuffer<__half> deviceDz(dh.size());
+    deviceDh.CopyFromHost(dh.data(), dh.size());
+    deviceH.CopyFromHost(h.data(), h.size());
+    deviceS.CopyFromHost(s.data(), s.size());
+
+    ROCmKernels::Kernels::SiluBackwardHsFp16(deviceDh.Data(), deviceH.Data(), deviceS.Data(), deviceDz.Data(), nullptr, rows, columns);
+
+    std::vector<__half> actualDz(dh.size());
+    deviceDz.CopyToHost(actualDz.data(), actualDz.size());
+
+    double worst = 0.0;
+    for (std::size_t index = 0; index < dh.size(); ++index) {
+        const float sigmoid = __half2float(s[index]);
+        const float activation = __half2float(h[index]);
+        const float expected = __half2float(dh[index]) * (sigmoid + activation * (1.0f - sigmoid));
+        worst = std::max(worst, static_cast<double>(std::abs(__half2float(actualDz[index]) - expected)));
+    }
+    CHECK(worst < 5e-3);
+}

@@ -4,6 +4,7 @@
 #include <hip/hip_runtime.h>
 
 #include <cstddef>
+#include <cstdint>
 
 namespace {
     constexpr int kTile = 32;
@@ -51,6 +52,47 @@ namespace {
         dz[index] = __float2half_rn(__half2float(dh[index]) * sigmoid * (1.0f + zValue * (1.0f - sigmoid)));
     }
 
+    // h = silu(z) and s = sigmoid(z) come from the forward. silu'(z) = s + h(1-s),
+    // so this needs neither z nor exp and does not rewrite h. Eight elements per
+    // thread; the tail up to seven elements is handled by the last block.
+    __global__ void silu_backward_hs_kernel(const __half *dh, const __half *h, const __half *s, __half *dz, const std::size_t elements) {
+        const std::size_t vectors = elements / 8;
+        const std::size_t vectorIndex = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+        if (vectorIndex < vectors) {
+            const std::size_t base = vectorIndex * 8;
+            const uint4 dhv = *reinterpret_cast<const uint4 *>(dh + base);
+            const uint4 hv = *reinterpret_cast<const uint4 *>(h + base);
+            const uint4 sv = *reinterpret_cast<const uint4 *>(s + base);
+            const __half *dhh = reinterpret_cast<const __half *>(&dhv);
+            const __half *hh = reinterpret_cast<const __half *>(&hv);
+            const __half *ss = reinterpret_cast<const __half *>(&sv);
+            __align__(16) __half out[8];
+            #pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const float sigmoid = __half2float(ss[i]);
+                const float activation = __half2float(hh[i]);
+                out[i] = __float2half_rn(__half2float(dhh[i]) * (sigmoid + activation * (1.0f - sigmoid)));
+            }
+            *reinterpret_cast<uint4 *>(dz + base) = *reinterpret_cast<const uint4 *>(out);
+            return;
+        }
+        const std::size_t tail = vectorIndex - vectors;
+        if (tail < elements - vectors * 8) {
+            const std::size_t index = vectors * 8 + tail;
+            const float sigmoid = __half2float(s[index]);
+            const float activation = __half2float(h[index]);
+            dz[index] = __float2half_rn(__half2float(dh[index]) * (sigmoid + activation * (1.0f - sigmoid)));
+        }
+    }
+
+    __global__ void silu_backward_hs_scalar_kernel(const __half *dh, const __half *h, const __half *s, __half *dz, const std::size_t elements) {
+        const std::size_t index = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+        if (index >= elements) return;
+        const float sigmoid = __half2float(s[index]);
+        const float activation = __half2float(h[index]);
+        dz[index] = __float2half_rn(__half2float(dh[index]) * (sigmoid + activation * (1.0f - sigmoid)));
+    }
+
     // db = sum_rows(dz), split over row chunks. The chunks accumulate into dbias
     // in an arbitrary order, so the sum is reproducible only to fp32 rounding.
     __global__ void bias_backward_kernel(const __half *dz, float *dbias, const int rows, const int columns) {
@@ -96,6 +138,29 @@ extern "C" ROCMKERNELS_EXPORT int silu_backward_s_fp16(const void *dh, const voi
     hipLaunchKernelGGL(silu_backward_s_kernel, dim3((elements + 255) / 256), dim3(256), 0, stream, static_cast<const __half *>(dh),
                        static_cast<const __half *>(z), static_cast<const __half *>(s), static_cast<__half *>(dz), static_cast<__half *>(h),
                        elements);
+    hipError_t status = hipGetLastError();
+    if (status != hipSuccess) return status;
+    if (dbias != nullptr) launch_bias(static_cast<const __half *>(dz), dbias, rows, columns, stream);
+    return hipGetLastError();
+}
+
+extern "C" ROCMKERNELS_EXPORT int silu_backward_hs_fp16(const void *dh, const void *h, const void *s, void *dz, float *dbias, int rows,
+        int columns, hipStream_t stream) {
+    if (!dh || !h || !s || !dz || rows <= 0 || columns <= 0) return hipErrorInvalidValue;
+    const std::size_t elements = static_cast<std::size_t>(rows) * columns;
+    const bool aligned = ((reinterpret_cast<std::uintptr_t>(dh) | reinterpret_cast<std::uintptr_t>(h) |
+                           reinterpret_cast<std::uintptr_t>(s) | reinterpret_cast<std::uintptr_t>(dz)) & 15) == 0;
+    if (aligned) {
+        const std::size_t vectors = elements / 8;
+        const std::size_t blocks = (vectors + 255) / 256 + (elements > vectors * 8 ? 1 : 0);
+        hipLaunchKernelGGL(silu_backward_hs_kernel, dim3(static_cast<unsigned>(blocks)), dim3(256), 0, stream,
+                           static_cast<const __half *>(dh), static_cast<const __half *>(h), static_cast<const __half *>(s),
+                           static_cast<__half *>(dz), elements);
+    } else {
+        hipLaunchKernelGGL(silu_backward_hs_scalar_kernel, dim3((elements + 255) / 256), dim3(256), 0, stream,
+                           static_cast<const __half *>(dh), static_cast<const __half *>(h), static_cast<const __half *>(s),
+                           static_cast<__half *>(dz), elements);
+    }
     hipError_t status = hipGetLastError();
     if (status != hipSuccess) return status;
     if (dbias != nullptr) launch_bias(static_cast<const __half *>(dz), dbias, rows, columns, stream);

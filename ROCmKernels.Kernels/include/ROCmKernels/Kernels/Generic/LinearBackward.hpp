@@ -13,6 +13,8 @@ extern "C" ROCMKERNELS_EXPORT int silu_backward_s_fp16(const void *dh, const voi
 extern "C" ROCMKERNELS_EXPORT int transpose_fp16(const void *source, void *destination, int rows, int columns, hipStream_t stream);
 extern "C" ROCMKERNELS_EXPORT int silu_backward_fp16(const void *dh, const void *z, void *dz, void *h, float *dbias, int rows,
         int columns, hipStream_t stream);
+extern "C" ROCMKERNELS_EXPORT int silu_backward_hs_fp16(const void *dh, const void *h, const void *s, void *dz, float *dbias, int rows,
+        int columns, hipStream_t stream);
 
 namespace ROCmKernels::Kernels {
     /// destination[c][r] = source[r][c], fp16.
@@ -25,6 +27,13 @@ namespace ROCmKernels::Kernels {
     inline void SiluBackwardFp16(const void *dh, const void *z, void *dz, void *h, float *dbias, const int rows, const int columns,
             hipStream_t stream = nullptr) {
         ROCMKERNELS_HIP_CHECK(silu_backward_fp16(dh, z, dz, h, dbias, rows, columns, stream));
+    }
+
+    /// Uses h = silu(z) and s = sigmoid(z) from the forward; dz = dh * (s + h(1-s)).
+    /// No z buffer, no exp. dbias[c] = sum_r dz[r][c]; dbias may be null.
+    inline void SiluBackwardHsFp16(const void *dh, const void *h, const void *s, void *dz, float *dbias, const int rows, const int columns,
+            hipStream_t stream = nullptr) {
+        ROCMKERNELS_HIP_CHECK(silu_backward_hs_fp16(dh, h, s, dz, dbias, rows, columns, stream));
     }
 } // namespace ROCmKernels::Kernels
 
