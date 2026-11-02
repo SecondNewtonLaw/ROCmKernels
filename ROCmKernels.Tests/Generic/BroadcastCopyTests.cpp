@@ -243,10 +243,12 @@ TEST_CASE("Broadcast binary and fill validate their arguments", "[generic][valid
     }
 
     SECTION("broadcast rejects a second operand aliased with the output") {
-        const float a = 1.0f;
-        float b = 2.0f;
+        const float a[2]{1.0f, 1.0f};
+        float b[3]{2.0f, 3.0f, 4.0f};
 
-        CHECK(broadcast_binary_forward(&a, &b, &b, 1, 1, BinaryOp::Add, BroadcastMode::Scalar, DType::Float32, nullptr) ==
+        CHECK(broadcast_binary_forward(a, b, b, 1, 2, BinaryOp::Add, BroadcastMode::None, DType::Float32, nullptr) ==
+                hipErrorInvalidValue);
+        CHECK(broadcast_binary_forward(a, b, b + 1, 1, 2, BinaryOp::Add, BroadcastMode::None, DType::Float32, nullptr) ==
                 hipErrorInvalidValue);
     }
 
