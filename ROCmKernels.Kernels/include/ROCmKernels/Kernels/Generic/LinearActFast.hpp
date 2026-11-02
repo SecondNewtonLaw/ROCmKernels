@@ -15,6 +15,8 @@ extern "C" ROCMKERNELS_EXPORT int linear_fast(const void *input, const void *wei
         int inner, ROCmKernels::Kernels::DType dtype, hipStream_t stream);
 extern "C" ROCMKERNELS_EXPORT int linear_act_nt(const void *input, const void *weight, const void *bias, void *output, int rows, int columns,
         int inner, ROCmKernels::Kernels::DType dtype, hipStream_t stream);
+extern "C" ROCMKERNELS_EXPORT int linear_fast_fp32_out(const void *input, const void *weight, const void *bias, void *output, int rows,
+        int columns, int inner, hipStream_t stream);
 extern "C" ROCMKERNELS_EXPORT int linear_nt(const void *input, const void *weight, const void *bias, void *output, int rows, int columns,
         int inner, ROCmKernels::Kernels::DType dtype, hipStream_t stream);
 
@@ -43,3 +45,4 @@ namespace ROCmKernels::Kernels {
         ROCMKERNELS_HIP_CHECK(linear_nt(input, weight, bias, output, rows, columns, inner, dtype, stream));
     }
 } // namespace ROCmKernels::Kernels
+
