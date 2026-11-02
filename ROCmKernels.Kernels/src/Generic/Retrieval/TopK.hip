@@ -1,4 +1,4 @@
-// Per-row top-k with a bitonic merge, ported from llama.cpp ggml-cuda top-k.cu and argsort.cu
+// Per-row top-k with a wave-shuffle merge, originally ported from llama.cpp ggml-cuda top-k.cu and argsort.cu
 // (MIT, Copyright (c) 2023-2026 The ggml authors).
 #include <ROCmKernels/Kernels/Generic/TopK.hpp>
 
@@ -9,8 +9,8 @@
 
 namespace {
     constexpr int kThreads = 256;
+    constexpr int kWarps = kThreads / 32;
     constexpr int kMaxK = 8;
-    constexpr int kCandidates = kThreads * kMaxK;
 
     // True when a must precede b in the descending output; equal values order by class index.
     __device__ __forceinline__ bool candidate_before(const float valueA, const int indexA, const float valueB, const int indexB) {
@@ -38,35 +38,42 @@ namespace {
         }
     }
 
-    // Sorts the shared candidate pairs into the order the output expects.
-    __device__ __forceinline__ void bitonic_sort_descending(float *values, int *indices) {
-        for (int span = 2; span <= kCandidates; span <<= 1) {
-            for (int stride = span >> 1; stride > 0; stride >>= 1) {
-                for (int i = threadIdx.x; i < kCandidates; i += kThreads) {
-                    const int partner = i ^ stride;
-                    if (partner < i) continue;
-
-                    const bool lowerHalfFirst = (i & span) == 0;
-                    const bool swap = lowerHalfFirst ? candidate_before(values[partner], indices[partner], values[i], indices[i])
-                                                     : candidate_before(values[i], indices[i], values[partner], indices[partner]);
-                    if (swap) {
-                        const float otherValue = values[partner];
-                        const int otherIndex = indices[partner];
-                        values[partner] = values[i];
-                        indices[partner] = indices[i];
-                        values[i] = otherValue;
-                        indices[i] = otherIndex;
-                    }
+    // Merges the sorted per-lane lists of a wave: K rounds pick the best head across lanes and pop it from its owner.
+    // Every lane receives the merged list.
+    template<int K>
+    __device__ __forceinline__ void wave_top_k(float *values, int *indices, float *mergedValues, int *mergedIndices) {
+        #pragma unroll
+        for (int round = 0; round < K; ++round) {
+            float bestValue = values[0];
+            int bestIndex = indices[0];
+            #pragma unroll
+            for (int offset = 16; offset > 0; offset >>= 1) {
+                const float otherValue = __shfl_xor(bestValue, offset, 32);
+                const int otherIndex = __shfl_xor(bestIndex, offset, 32);
+                if (candidate_before(otherValue, otherIndex, bestValue, bestIndex)) {
+                    bestValue = otherValue;
+                    bestIndex = otherIndex;
                 }
-                __syncthreads();
+            }
+            mergedValues[round] = bestValue;
+            mergedIndices[round] = bestIndex;
+
+            if (indices[0] == bestIndex && values[0] == bestValue) {
+                #pragma unroll
+                for (int slot = 0; slot < K - 1; ++slot) {
+                    values[slot] = values[slot + 1];
+                    indices[slot] = indices[slot + 1];
+                }
+                values[K - 1] = -INFINITY;
+                indices[K - 1] = -1;
             }
         }
     }
 
     template<typename T, int K>
     __global__ void top_k_forward_kernel(const T *scores, float *values, int *indices, const int classes) {
-        __shared__ float sharedValues[kCandidates];
-        __shared__ int sharedIndices[kCandidates];
+        __shared__ float sharedValues[kWarps][K];
+        __shared__ int sharedIndices[kWarps][K];
 
         const std::size_t row = blockIdx.x;
         const T *rowScores = scores + row * classes;
@@ -84,25 +91,34 @@ namespace {
             insert_candidate<K>(bestValues, bestIndices, ROCmKernels::Kernels::LoadScalar(rowScores + column), column);
         }
 
-        // Phase 2: one candidate block per thread, padding the tail with empty slots.
-        #pragma unroll
-        for (int slot = 0; slot < K; ++slot) {
-            sharedValues[threadIdx.x * K + slot] = bestValues[slot];
-            sharedIndices[threadIdx.x * K + slot] = bestIndices[slot];
-        }
-        for (int slot = kThreads * K + threadIdx.x; slot < kCandidates; slot += kThreads) {
-            sharedValues[slot] = -INFINITY;
-            sharedIndices[slot] = -1;
+        // Phase 2: merge each wave's lists, then wave 0 merges the per-wave results.
+        const int lane = threadIdx.x % 32;
+        const int wave = threadIdx.x / 32;
+        float mergedValues[K];
+        int mergedIndices[K];
+        wave_top_k<K>(bestValues, bestIndices, mergedValues, mergedIndices);
+        if (lane == 0) {
+            #pragma unroll
+            for (int slot = 0; slot < K; ++slot) {
+                sharedValues[wave][slot] = mergedValues[slot];
+                sharedIndices[wave][slot] = mergedIndices[slot];
+            }
         }
         __syncthreads();
+        if (wave != 0) return;
 
-        // Phase 3: merge the candidates with a block-wide bitonic sort.
-        bitonic_sort_descending(sharedValues, sharedIndices);
-
-        // Phase 4: the sorted head is the answer.
-        if (static_cast<int>(threadIdx.x) < K) {
-            values[row * K + threadIdx.x] = sharedValues[threadIdx.x];
-            indices[row * K + threadIdx.x] = sharedIndices[threadIdx.x];
+        #pragma unroll
+        for (int slot = 0; slot < K; ++slot) {
+            bestValues[slot] = lane < kWarps ? sharedValues[lane][slot] : -INFINITY;
+            bestIndices[slot] = lane < kWarps ? sharedIndices[lane][slot] : -1;
+        }
+        wave_top_k<K>(bestValues, bestIndices, mergedValues, mergedIndices);
+        #pragma unroll
+        for (int slot = 0; slot < K; ++slot) {
+            if (slot == lane) {
+                values[row * K + slot] = mergedValues[slot];
+                indices[row * K + slot] = mergedIndices[slot];
+            }
         }
     }
 
