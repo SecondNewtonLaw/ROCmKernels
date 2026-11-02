@@ -141,6 +141,12 @@ case("ffn up 128-row tile",
 case("ffn down 128-row tile",
      lambda: F.linear(h1[:128], w2),
      lambda: linear_plain(ptr(h1), ptr(w2t), None, ptr(y1), 128, D, E, FP16, stream), 1)
+case("ffn up 2048-row tile",
+     lambda: F.silu(F.linear(x[:2048], w1)),
+     lambda: linear_act(ptr(x), ptr(w1t), None, ptr(h1), 2048, E, D, FP16, stream), 1)
+case("ffn down 2048-row tile",
+     lambda: F.linear(h1[:2048], w2),
+     lambda: linear_plain(ptr(h1), ptr(w2t), None, ptr(y1), 2048, D, E, FP16, stream), 1)
 
 # ------------------------------------------------------------------ layer norm block op
 res = torch.randn(P_, D, device=DEV, dtype=torch.float16)
@@ -193,5 +199,6 @@ case("w2 linear (repeat)",
      lambda: linear_plain(ptr(h), ptr(w2t), None, ptr(y), P_, D, E, FP16, stream), 24)
 
 print(f"\nwrote {OUT}")
+
 
 
