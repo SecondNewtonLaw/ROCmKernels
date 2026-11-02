@@ -1,0 +1,14 @@
+/.idea
+/.vs
+/_deps
+/CMakeFiles
+/CMakeCache.txt
+/CMakeUserPresets.json
+/cpm-package-lock.cmake
+/get_cpm.cmake
+/cmake-build
+/cmake-build-*
+/build
+/out
+/cmake/CPM_*
+*.obj
