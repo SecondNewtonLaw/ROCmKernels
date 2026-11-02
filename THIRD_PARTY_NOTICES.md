@@ -8,6 +8,7 @@ The following kernels are ports or adaptations of code from
 - `ROCmKernels.Kernels/src/Generic/Norm/RMSNorm.hip` (from `norm.cu`)
 - `ROCmKernels.Kernels/src/Generic/Positional/Rope.hip` (from `rope.cu`)
 - `ROCmKernels.Kernels/src/Generic/Retrieval/TopK.hip` (from `top-k.cu` and `argsort.cu`)
+- `ROCmKernels.Kernels/src/Generic/Embedding/RowGather.hip` (from `getrows.cu` and `set-rows.cu`)
 - `ROCmKernels.Kernels/src/Generic/Linear/LinearActVec.hip` (from `mmvf.cu`)
 - `ROCmKernels.Kernels/src/Generic/Loss/Softmax.hip` (from `softmax.cu`)
 
