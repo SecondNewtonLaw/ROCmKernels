@@ -214,6 +214,29 @@ static __global__ void gemm_kernel(const float* A, const float* B, float* C, con
     }
 }
 
+// B = c3 * I + c4 * a + c5 * a^2, the Newton-Schulz quintic denominator.
+// Building B elementwise removes the second y^T y of every iteration.
+static __global__ void make_b_kernel(const float* a, const float* a2, float* b, int n, float c3, float c4, float c5) {
+    const int matrix = blockIdx.z;
+    const int64_t total = static_cast<int64_t>(n) * n;
+    const int64_t base = static_cast<int64_t>(matrix) * total;
+    for (int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; index < total;
+         index += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+        const int row = static_cast<int>(index) / n, column = static_cast<int>(index) % n;
+        float value = c4 * a[base + index] + c5 * a2[base + index];
+        if (row == column) value += c3;
+        b[base + index] = value;
+    }
+}
+
+extern "C" ROCMKERNELS_EXPORT int muon_fp32_make_b(const float* a, const float* a2, float* b, int count, int n, float c3, float c4, float c5,
+                                        hipStream_t stream) {
+    if (count < 1 || n <= 0 || (n % TILE)) return hipErrorInvalidValue;
+    const int blocks = static_cast<int>((static_cast<int64_t>(n) * n + 255) / 256 < 64 ? (static_cast<int64_t>(n) * n + 255) / 256 : 64);
+    hipLaunchKernelGGL(make_b_kernel, dim3(blocks, 1, count), dim3(256), 0, stream, a, a2, b, n, c3, c4, c5);
+    return hipGetLastError();
+}
+
 extern "C" ROCMKERNELS_EXPORT int muon_fp32_supported(int rows, int columns) {
     const int m = rows >= columns ? rows : columns, n = rows >= columns ? columns : rows;
     return n % TILE == 0 && m % TILE == 0;
@@ -262,4 +285,6 @@ extern "C" ROCMKERNELS_EXPORT int muon_fp32_apply(const float* y, const float* b
                        0.0f, 0.0f, mode, 0.0f, params, flags, decay_factor, step, transposed);
     return hipGetLastError();
 }
+
+
 

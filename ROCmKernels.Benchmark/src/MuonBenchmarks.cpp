@@ -34,6 +34,13 @@ namespace {
             this->gin.Resize(innerElements * this->count);
             this->gram.Resize(innerElements * this->count);
             this->out.Resize(matrixElements * this->count);
+            this->a2.Resize(innerElements * this->count);
+            this->identity.Resize(innerElements * this->count);
+            std::vector<float> hostIdentity(innerElements * this->count, 0.0f);
+            for (int matrix = 0; matrix < this->count; ++matrix)
+                for (int index = 0; index < this->n; ++index)
+                    hostIdentity[static_cast<std::size_t>(matrix) * innerElements + static_cast<std::size_t>(index) * this->n + index] = 1.0f;
+            this->identity.CopyFromHost(hostIdentity.data(), hostIdentity.size());
 
             const std::vector<float> hostGradient(matrixElements * this->count, 0.5f);
             const std::vector<float> hostBuffer(matrixElements * this->count, 0.25f);
@@ -82,6 +89,8 @@ namespace {
         ROCmKernels::DeviceBuffer<float> gin;
         ROCmKernels::DeviceBuffer<float> gram;
         ROCmKernels::DeviceBuffer<float> out;
+        ROCmKernels::DeviceBuffer<float> a2;
+        ROCmKernels::DeviceBuffer<float> identity;
     };
 
     ROCmKernels::Benchmark::Case MakePrepareCase(const int m, const int n, const int count) {
@@ -155,14 +164,49 @@ namespace {
         };
     }
 
+    // Full Newton-Schulz step as the trainer runs it: prepare, five quintic
+    // iterations (gram, a@a, B = c3 I + c4 a + c5 a^2, y = y B) and the update.
+    ROCmKernels::Benchmark::Case MakeStepCase(const int m, const int n, const int count) {
+        const auto state = std::make_shared<State>(m, n, count);
+
+        return ROCmKernels::Benchmark::Case{
+            .name = "Muon NS-5 step count=" + std::to_string(count) + " " + std::to_string(m) + "x" + std::to_string(n),
+            .setup = [state] { state->Initialize(false); },
+            .run =
+                [state](hipStream_t stream) {
+                    const auto &s = *state;
+                    ROCmKernels::Kernels::MuonPrepare(s.gradientPointers.Data(), s.bufferPointers.Data(), s.y.Data(), s.flags.Data(), s.sumsq.Data(),
+                            s.count, s.m, s.n, 0.95f, stream);
+                    for (int iteration = 0; iteration < 5; ++iteration) {
+                        const bool scaled = iteration == 0;
+                        ROCmKernels::Kernels::MuonGram(s.y.Data(), nullptr, s.gram.Data(), s.sumsq.Data(), s.count, s.m, s.n, 1.0f, 0.0f, 0.0f,
+                                scaled, stream);
+                        ROCmKernels::Kernels::MuonMultiply(s.gram.Data(), s.gram.Data(), s.a2.Data(), s.sumsq.Data(), s.count, s.n, s.n, false, stream);
+                        ROCmKernels::Kernels::MuonMakeB(s.gram.Data(), s.a2.Data(), s.b.Data(), s.count, s.n, 3.4445f, -4.7750f, 2.0315f, stream);
+                        ROCmKernels::Kernels::MuonMultiply(s.y.Data(), s.b.Data(), s.y.Data(), s.sumsq.Data(), s.count, s.m, s.n, scaled, stream);
+                    }
+                    ROCmKernels::Kernels::MuonApply(s.y.Data(), s.identity.Data(), s.parameterPointers.Data(), s.flags.Data(), s.sumsq.Data(),
+                            s.count, s.m, s.n, false, s.m < s.n, 1e-2f, 1e-2f * 0.2f * std::sqrt(static_cast<float>(s.m > s.n ? s.m : s.n)), stream);
+                },
+            .bytesMoved = 0,
+            .operations = static_cast<std::uint64_t>(count) * (5ull * 2ull * static_cast<std::uint64_t>(m) * n * n * 2 + static_cast<std::uint64_t>(m) * n * 3),
+        };
+    }
+
     struct Registrar {
         Registrar() {
             ROCmKernels::Benchmark::Register(MakePrepareCase(256, 256, 4));
             ROCmKernels::Benchmark::Register(MakeGramCase(256, 256, 4));
             ROCmKernels::Benchmark::Register(MakeMultiplyCase(256, 256, 4));
             ROCmKernels::Benchmark::Register(MakeApplyCase(256, 256, 4));
+            ROCmKernels::Benchmark::Register(MakeStepCase(8192, 128, 12));
+            ROCmKernels::Benchmark::Register(MakeStepCase(384, 128, 12));
+            ROCmKernels::Benchmark::Register(MakeStepCase(128, 128, 17));
         }
     };
 
     [[maybe_unused]] const Registrar kRegistrar;
 } // namespace
+
+
+
