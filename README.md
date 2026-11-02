@@ -103,6 +103,20 @@ The captures can be inspected without the GUI: `rgp-analyzer inspect <file>.rgp`
 
 Direct HIP capture still crashes the process, and the Windows `HSA_OVERRIDE_GFX_VERSION=10.3.0` trick does not change that. The official 7.1 runtime still reports no ROCm-capable device, the pip runtime keeps reporting gfx1031, and a gfx1030-compiled binary is rejected with an invalid kernel image.
 
+### Instruction-level work
+
+`scripts/Disassemble.ps1` compiles one translation unit to gfx1031 assembly, and `ROCmKernels.IsaBench` measures individual instructions on the card with `s_memtime`.
+
+```powershell
+pwsh scripts/Disassemble.ps1 -Source ROCmKernels.Kernels/src/Generic/Linear/LinearActFast.hip -Output build/isa/LinearActFast.s
+cmake --build --preset release --target ROCmKernels.IsaBench
+build/release/ROCmKernels.IsaBench.exe
+```
+
+The first measured set on this card: `v_fma_f32`, `v_dot2_f32_f16` and `v_dot4c_i32_i8` each have a 6.13-cycle dependent latency and a 1.72-cycle issue interval for one wave; `v_exp_f32` is 10.81 cycles; a dependent `ds_read_b32` chain is 65 cycles including the address update, and LDS throughput is 3.13 cycles per 32-lane load. `s_memtime` calibrates to 2.65 GHz. The full ISA reference, the complete opcode list from AMD's machine-readable RDNA2 spec, the hazard rules and the inline-assembly guide are in the project skill at `.opencode/skills/write-isa/SKILL.md`.
+
+The worked example is the fp16 GEMM: the compiler's fp32 path is LDS-bound at 5.25 TFLOP/s, and a hand-written `v_dot2_f32_f16` path with K-contiguous half tiles reaches 8.53 TFLOP/s. The same instruction on the wrong layout is slower, so every hand-written sequence is benchmarked against the compiler's.
+
 ### Disclaimer
 
 Not affiliated with AMD. The RX 6700 is unsupported by ROCm, so driver and runtime behaviour can change between versions. Nothing here is guaranteed to work on another GPU or another ROCm build. MIT licensed, no warranty.
@@ -210,4 +224,5 @@ An installation can compile gfx1031 code and still fail to detect the card. The 
 | `BUILD_TESTING` | `ON` | Build the Catch2 test binary |
 | `BUILD_BENCHMARKS` | `ON` | Build the benchmark executable |
 | `BUILD_PROFILING_TOOLS` | `OFF` | Build `OpenClProbe` for the profiling skill |
+| `BUILD_ISA_BENCH` | `ON` | Build the RDNA2 instruction microbenchmark |
 | `ROCMKERNELS_EMIT_ASSEMBLY` | `ON` | Provide the `ROCmKernels.Assembly` target |
