@@ -216,7 +216,11 @@ TEST_CASE("Q8_0 GEMV matches the dequantized reference", "[generic][quantized]")
 TEST_CASE("Q8_0 rejects invalid shapes", "[generic][quantized]") {
     using namespace ROCmKernels::Kernels;
 
-    CHECK(quantize_q8_0(nullptr, nullptr, 33, nullptr) == hipErrorInvalidValue);
-    CHECK(dequantize_q8_0(nullptr, nullptr, 0, nullptr) == hipErrorInvalidValue);
-    CHECK(quantized_gemv_q8_0(nullptr, nullptr, nullptr, nullptr, 1, 33, DType::Float32, nullptr) == hipErrorInvalidValue);
+    float values[64] = {};
+    BlockQ8_0 blocks[2] = {};
+
+    CHECK(quantize_q8_0(values, blocks, 33, nullptr) == hipErrorInvalidValue);
+    CHECK(dequantize_q8_0(blocks, values, 0, nullptr) == hipErrorInvalidValue);
+    CHECK(quantized_gemv_q8_0(blocks, blocks, nullptr, values, 1, 33, DType::Float32, nullptr) == hipErrorInvalidValue);
+    CHECK(quantized_gemv_q8_0(blocks, blocks, nullptr, values, 0, 32, DType::Float32, nullptr) == hipErrorInvalidValue);
 }

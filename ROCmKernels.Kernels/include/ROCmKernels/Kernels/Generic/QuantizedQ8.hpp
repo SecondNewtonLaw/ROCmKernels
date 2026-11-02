@@ -40,6 +40,7 @@ namespace ROCmKernels::Kernels {
     }
 
     /// output[c] = sum_k input[k] * weights[c][k] + bias[c] over dequantized values; bias may be null.
+    /// input is [inner / kQ8Block] blocks and weights is [columns][inner / kQ8Block] blocks.
     inline void QuantizedGEMVQ8_0(const BlockQ8_0 *input, const BlockQ8_0 *weights, const void *bias, void *output, const int columns,
             const int inner, const DType outputDtype, hipStream_t stream = nullptr) {
         ROCMKERNELS_HIP_CHECK(quantized_gemv_q8_0(input, weights, bias, output, columns, inner, outputDtype, stream));
