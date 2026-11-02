@@ -489,9 +489,9 @@ namespace {
         }
     }
 
-    template<int Rows, int Columns, int TileRows, int TileColumns, int KTile, bool Activate, bool FloatOut>
+    template<int Rows, int Columns, int TileRows, int TileColumns, int KTile, bool Activate, bool FloatOut, bool EmitS>
     __global__ __launch_bounds__(kThreads) void linear_act_fast_half_wide_kernel(const __half *input, const __half *weight, const __half *bias,
-            void *output, const int rows, const int columns, const int inner) {
+            void *output, __half *sigmoidOut, const int rows, const int columns, const int inner) {
         __shared__ __half tileA[Rows][KTile + 2];
         __shared__ __half tileB[Columns][KTile + 2];
 
@@ -542,7 +542,12 @@ namespace {
                 if (column >= columns) continue;
                 const float value = accumulators[i][j] + biasValues[j];
                 const std::size_t index = static_cast<std::size_t>(row) * columns + column;
-                if constexpr (FloatOut) static_cast<float *>(output)[index] = Activate ? silu(value) : value;
+                if constexpr (EmitS) {
+                    // One exp for both the activation and the sigmoid the backward reuses.
+                    const float sigmoid = 1.0f / (1.0f + __expf(-value));
+                    static_cast<__half *>(output)[index] = __float2half_rn(value * sigmoid);
+                    sigmoidOut[index] = __float2half_rn(sigmoid);
+                } else if constexpr (FloatOut) static_cast<float *>(output)[index] = Activate ? silu(value) : value;
                 else static_cast<__half *>(output)[index] = __float2half_rn(Activate ? silu(value) : value);
             }
         }
@@ -553,14 +558,14 @@ namespace {
         if constexpr (std::is_same_v<T, __half> && !Transposed) {
             if (columns > 128) {
                 const dim3 grid((columns + 63) / 64, (rows + 127) / 128);
-                hipLaunchKernelGGL((linear_act_fast_half_wide_kernel<128, 64, 8, 4, 64, Activate, false>), grid, dim3(kThreadsX, kThreadsY), 0, stream,
+                hipLaunchKernelGGL((linear_act_fast_half_wide_kernel<128, 64, 8, 4, 64, Activate, false, false>), grid, dim3(kThreadsX, kThreadsY), 0, stream,
                         static_cast<const __half *>(input), static_cast<const __half *>(weight), static_cast<const __half *>(bias),
-                        static_cast<__half *>(output), rows, columns, inner);
+                        static_cast<__half *>(output), nullptr, rows, columns, inner);
             } else {
                 const dim3 grid((columns + 127) / 128, (rows + 63) / 64);
-                hipLaunchKernelGGL((linear_act_fast_half_wide_kernel<64, 128, 4, 8, 32, Activate, false>), grid, dim3(kThreadsX, kThreadsY), 0, stream,
+                hipLaunchKernelGGL((linear_act_fast_half_wide_kernel<64, 128, 4, 8, 32, Activate, false, false>), grid, dim3(kThreadsX, kThreadsY), 0, stream,
                         static_cast<const __half *>(input), static_cast<const __half *>(weight), static_cast<const __half *>(bias),
-                        static_cast<__half *>(output), rows, columns, inner);
+                        static_cast<__half *>(output), nullptr, rows, columns, inner);
             }        } else if constexpr (std::is_same_v<T, __half>) {
             const dim3 grid((columns + kBlockColumns - 1) / kBlockColumns, (rows + kBlockRows - 1) / kBlockRows);
             hipLaunchKernelGGL((linear_act_fast_half_kernel<16, Activate, true>), grid, dim3(kThreadsX, kThreadsY), 0, stream,
@@ -606,22 +611,44 @@ extern "C" ROCMKERNELS_EXPORT int linear_nt(const void *input, const void *weigh
 }
 
 // Same K-major fp16 GEMM with an fp32 output, for weight gradients.
+// Same as linear_act_fast and additionally writes sigmoid(z) so the backward
+// never has to evaluate exp again.
+extern "C" ROCMKERNELS_EXPORT int linear_act_fast_s(const void *input, const void *weight, const void *bias, void *output, void *sigmoidOut,
+        int rows, int columns, int inner, hipStream_t stream) {
+    if (!input || !weight || !output || !sigmoidOut || rows <= 0 || columns <= 0 || inner <= 0) return hipErrorInvalidValue;
+    if (columns > 128) {
+        const dim3 grid((columns + 63) / 64, (rows + 127) / 128);
+        hipLaunchKernelGGL((linear_act_fast_half_wide_kernel<128, 64, 8, 4, 64, true, false, true>), grid, dim3(kThreadsX, kThreadsY), 0, stream,
+                static_cast<const __half *>(input), static_cast<const __half *>(weight), static_cast<const __half *>(bias),
+                static_cast<__half *>(output), static_cast<__half *>(sigmoidOut), rows, columns, inner);
+    } else {
+        const dim3 grid((columns + 127) / 128, (rows + 63) / 64);
+        hipLaunchKernelGGL((linear_act_fast_half_wide_kernel<64, 128, 4, 8, 32, true, false, true>), grid, dim3(kThreadsX, kThreadsY), 0, stream,
+                static_cast<const __half *>(input), static_cast<const __half *>(weight), static_cast<const __half *>(bias),
+                static_cast<__half *>(output), static_cast<__half *>(sigmoidOut), rows, columns, inner);
+    }
+    return hipGetLastError();
+}
+
 extern "C" ROCMKERNELS_EXPORT int linear_fast_fp32_out(const void *input, const void *weight, const void *bias, void *output, int rows,
         int columns, int inner, hipStream_t stream) {
     if (!input || !weight || !output || rows <= 0 || columns <= 0 || inner <= 0) return hipErrorInvalidValue;
     if (columns > 128) {
         const dim3 grid((columns + 63) / 64, (rows + 127) / 128);
-        hipLaunchKernelGGL((linear_act_fast_half_wide_kernel<128, 64, 8, 4, 64, false, true>), grid, dim3(kThreadsX, kThreadsY), 0, stream,
-                static_cast<const __half *>(input), static_cast<const __half *>(weight), static_cast<const __half *>(bias), output, rows, columns,
-                inner);
+        hipLaunchKernelGGL((linear_act_fast_half_wide_kernel<128, 64, 8, 4, 64, false, true, false>), grid, dim3(kThreadsX, kThreadsY), 0, stream,
+                static_cast<const __half *>(input), static_cast<const __half *>(weight), static_cast<const __half *>(bias), output, nullptr, rows,
+                columns, inner);
     } else {
         const dim3 grid((columns + 127) / 128, (rows + 63) / 64);
-        hipLaunchKernelGGL((linear_act_fast_half_wide_kernel<64, 128, 4, 8, 32, false, true>), grid, dim3(kThreadsX, kThreadsY), 0, stream,
-                static_cast<const __half *>(input), static_cast<const __half *>(weight), static_cast<const __half *>(bias), output, rows, columns,
-                inner);
+        hipLaunchKernelGGL((linear_act_fast_half_wide_kernel<64, 128, 4, 8, 32, false, true, false>), grid, dim3(kThreadsX, kThreadsY), 0, stream,
+                static_cast<const __half *>(input), static_cast<const __half *>(weight), static_cast<const __half *>(bias), output, nullptr, rows,
+                columns, inner);
     }
     return hipGetLastError();
 }
+
+
+
 
 
 
