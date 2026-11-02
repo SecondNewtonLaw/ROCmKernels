@@ -150,6 +150,73 @@ namespace {
         std::printf("out[0]=%f out[last]=%f\n", hostOutput[0], hostOutput[qElements - 1]);
         return hostOutput[0] > 0.249f && hostOutput[0] < 0.251f ? 0 : 2;
     }
+    struct LinearShape {
+        int rows = 8192;
+        int columns = 8192;
+        int inner = 128;
+    };
+
+    int BindLinear(cl_context context, cl_command_queue queue, cl_kernel kernel, const LinearShape &shape, const int iterations) {
+        const std::size_t inputElements = static_cast<std::size_t>(shape.rows) * shape.inner;
+        const std::size_t weightElements = static_cast<std::size_t>(shape.inner) * shape.columns;
+        const std::size_t outputElements = static_cast<std::size_t>(shape.rows) * shape.columns;
+
+        const std::vector<unsigned short> hostInput(inputElements, 0x3800);   // 0.5 in fp16
+        const std::vector<unsigned short> hostWeight(weightElements, 0x3400); // 0.25 in fp16
+        const std::vector<unsigned short> hostBias(shape.columns, 0x3000);    // 0.125 in fp16
+        std::vector<unsigned short> hostOutput(1, 0);
+
+        cl_int error = CL_SUCCESS;
+        cl_mem input = pfnClCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, inputElements * 2,
+                const_cast<unsigned short *>(hostInput.data()), &error);
+        cl_mem weight = pfnClCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, weightElements * 2,
+                const_cast<unsigned short *>(hostWeight.data()), &error);
+        cl_mem bias = pfnClCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, shape.columns * 2,
+                const_cast<unsigned short *>(hostBias.data()), &error);
+        cl_mem output = pfnClCreateBuffer(context, CL_MEM_WRITE_ONLY, outputElements * 2, nullptr, &error);
+        if (error != CL_SUCCESS) {
+            std::printf("linear clCreateBuffer: %d\n", error);
+            return 1;
+        }
+
+        int argument = 0;
+        pfnClSetKernelArg(kernel, argument++, sizeof(cl_mem), &input);
+        pfnClSetKernelArg(kernel, argument++, sizeof(cl_mem), &weight);
+        pfnClSetKernelArg(kernel, argument++, sizeof(cl_mem), &bias);
+        pfnClSetKernelArg(kernel, argument++, sizeof(cl_mem), &output);
+        pfnClSetKernelArg(kernel, argument++, sizeof(int), &shape.rows);
+        pfnClSetKernelArg(kernel, argument++, sizeof(int), &shape.columns);
+        pfnClSetKernelArg(kernel, argument++, sizeof(int), &shape.inner);
+
+        const std::size_t blockX = 16;
+        const std::size_t blockY = 16;
+        const std::size_t gridX = (static_cast<std::size_t>(shape.columns) + 63) / 64;
+        const std::size_t gridY = (static_cast<std::size_t>(shape.rows) + 63) / 64;
+        const std::size_t global[2] = {gridX * blockX, gridY * blockY};
+        const std::size_t localSize[2] = {blockX, blockY};
+
+        for (int iteration = 0; iteration < iterations; ++iteration) {
+            error = pfnClEnqueueNDRangeKernel(queue, kernel, 2, nullptr, global, localSize, 0, nullptr, nullptr);
+            if (error != CL_SUCCESS) {
+                std::printf("clEnqueueNDRangeKernel: %d\n", error);
+                return 1;
+            }
+            if ((iteration % 200) == 0) {
+                pfnClFinish(queue);
+                std::printf("%d\n", iteration);
+                std::fflush(stdout);
+            }
+        }
+        pfnClFinish(queue);
+
+        error = pfnClEnqueueReadBuffer(queue, output, CL_TRUE, 0, 2, hostOutput.data(), 0, nullptr, nullptr);
+        if (error != CL_SUCCESS) {
+            std::printf("clEnqueueReadBuffer: %d\n", error);
+            return 1;
+        }
+        std::printf("out[0]=0x%04x\n", hostOutput[0]);
+        return 0;
+    }
 } // namespace
 
 int main(int argc, char **argv) {
@@ -158,6 +225,8 @@ int main(int argc, char **argv) {
     std::string waitFile;
     std::string readyFile;
     AttentionShape attentionShape;
+    LinearShape linearShape;
+    bool linear = false;
     int iterations = 1;
     bool listOnly = false;
 
@@ -177,6 +246,19 @@ int main(int argc, char **argv) {
         else if (argument == "--radius") attentionShape.radius = std::stoi(next());
         else if (argument == "--warps") attentionShape.warps = std::stoi(next());
         else if (argument == "--block-rows") attentionShape.blockRows = std::stoi(next());
+        else if (argument == "--linear") {
+            linear = true;
+            const std::string shape = next();
+            if (shape == "down") {
+                linearShape.rows = 8192;
+                linearShape.columns = 128;
+                linearShape.inner = 8192;
+            } else {
+                linearShape.rows = 8192;
+                linearShape.columns = 8192;
+                linearShape.inner = 128;
+            }
+        }
         else {
             PrintUsage();
             return 1;
@@ -283,6 +365,7 @@ int main(int argc, char **argv) {
         }
     }
 
+    if (linear) return BindLinear(context, queue, kernel, linearShape, iterations);
     const bool attention = kernelName.rfind("attention_", 0) == 0;
     if (attention) return BindAttention(context, queue, kernel, attentionShape, iterations);
 
@@ -324,5 +407,6 @@ int main(int argc, char **argv) {
     std::printf("out[0]=%f out[last]=%f\n", hostOut[0], hostOut[count - 1]);
     return (hostOut[0] == 3.0f && hostOut[count - 1] == 3.0f) ? 0 : 2;
 }
+
 
 

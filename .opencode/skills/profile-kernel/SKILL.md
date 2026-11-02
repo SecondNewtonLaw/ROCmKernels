@@ -203,6 +203,23 @@ and the shim is unnecessary. Check `clinfo` first; this driver currently reports
 
 ## Reading a capture without the GUI
 
+The Radeon Developer Tool Suite installed here (`F:\Tools\RadeonDeveloperToolSuite-2026-10-02-1872`)
+ships the panel, the CLI capture tool and RGA, but **no analyzer CLI**. There is no
+`rgp-analyzer-cli.exe` in the bundle and it is not on `PATH`.
+
+The third-party analyzer is https://github.com/taowen/rgp-analyzer-cli (GPL-2.0, Python, installed
+with `pip install -e .`). It targets Linux/RADV Vulkan captures and its SQTT decoding needs the
+vendored `native/rocm_sqtt_decoder_helper`, built on Linux; the README states its limits directly
+(no exec-mask data, no fine-grained stall taxonomy, no cacheline metrics). Treat it as a structural
+inspector for linux captures, not as a replacement for the RGP GUI on these Windows OpenCL captures.
+
+For the Windows OpenCL path the practical fallback is the static side: `ROCmKernels.Assembly` plus
+the InstructionMix script, and A/B wall time from the benchmark harness. The `.rgp` can still be
+opened in the RGP GUI when one is available; `build/profile/*.rgp` holds the captured dispatches.
+
+The container starts with the magic `42 30 30 50` ("B00P") and is not a zip archive, so do not
+expect `Expand-Archive` to read it.
+
 `rgp-analyzer-cli` reads the container and prints the queue events, code objects and SQTT sizes:
 
 ```powershell
@@ -255,3 +272,4 @@ A global size that is not divisible by the local size returns `CL_INVALID_WORK_G
 - `scripts/CaptureRgp.ps1` drives the RGP CLI capture.
 - `tools/ProfileKernel/OpenClProbe.cpp` loads a hsaco and dispatches it.
 - `tools/ProfileKernel/SampleKernel.hip` is the four-argument smoke test.
+

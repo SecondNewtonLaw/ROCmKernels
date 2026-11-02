@@ -122,6 +122,19 @@ target_include_directories(ROCmKernels.Kernels PUBLIC ROCmKernels.Kernels/includ
 target_link_libraries(ROCmKernels.Kernels PUBLIC ROCmKernels.Common)
 rocmkernels_apply_compile_options(ROCmKernels.Kernels)
 
+# Same sources as a DLL, so a training loop can call the kernels through ctypes.
+option(BUILD_SHARED_KERNELS "Build ROCmKernels.Kernels.Shared for ctypes harnesses." OFF)
+if (BUILD_SHARED_KERNELS)
+    add_library(ROCmKernels.Kernels.Shared SHARED
+            ${ROCMKERNELS_KERNEL_SOURCES}
+            ${ROCMKERNELS_KERNEL_HEADERS}
+    )
+    target_include_directories(ROCmKernels.Kernels.Shared PUBLIC ROCmKernels.Kernels/include)
+    target_link_libraries(ROCmKernels.Kernels.Shared PUBLIC ROCmKernels.Common)
+    rocmkernels_apply_compile_options(ROCmKernels.Kernels.Shared)
+    rocmkernels_deploy_hip_runtime(ROCmKernels.Kernels.Shared)
+endif ()
+
 if (ROCMKERNELS_EMIT_ASSEMBLY)
     set(ROCMKERNELS_ASSEMBLY_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/assembly")
     set(ROCMKERNELS_ASSEMBLY_OUTPUTS "")

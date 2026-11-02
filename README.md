@@ -101,6 +101,8 @@ That path is verified on this card. A HIP kernel dispatched through the OpenCL r
 
 The captures can be inspected without the GUI: `rgp-analyzer inspect <file>.rgp` reports each queue event's GPU duration, the code objects and the SQTT byte count; `resource-summary` reports VGPR and SGPR counts. That is enough to compare two variants from the same capture conditions. If the RGP panel stalls after `Capture API initialized` or reports `Failed to create router`, kill the stale panel process and reset the driver; a failed trace leaves the capture API wedged.
 
+RGP itself lives at `F:\Tools\RadeonDeveloperToolSuite-2026-10-02-1872` on the development machine; `RGP_CLI` must be pointed at `RadeonDeveloperPanelCLI.exe` there. That suite ships no analyzer CLI. The third-party reader is [taowen/rgp-analyzer-cli](https://github.com/taowen/rgp-analyzer-cli) (GPL-2.0, Python); it targets Linux/RADV captures and needs its native SQTT helper, so on these Windows OpenCL captures the instruction-level reading still goes through the RGP GUI. The container magic is `B00P`, not a zip.
+
 Direct HIP capture still crashes the process, and the Windows `HSA_OVERRIDE_GFX_VERSION=10.3.0` trick does not change that. The official 7.1 runtime still reports no ROCm-capable device, the pip runtime keeps reporting gfx1031, and a gfx1030-compiled binary is rejected with an invalid kernel image.
 
 ### Instruction-level work
@@ -114,6 +116,8 @@ build/release/ROCmKernels.IsaBench.exe
 ```
 
 The measured set on this card covers the vector, MUFU, integer, dot-product, LDS and global paths. Every VALU instruction issues at ~1.75 cycles per wave (two cycles at the real clock) with a ~6.1-cycle latency, and the encoding width does not matter: `v_fma_f32` and `v_add_f32` cost the same. MUFU and `v_mul_lo_u32` are half rate at ~4.6 cycles, with ~10.8 cycles of latency. LDS reads have a 34-cycle load-to-use latency and are conflict-free at every stride tested, including all 32 lanes in one bank; LDS writes are banked and a 32-way conflict costs 4.4x. `ds_read_b128` moves four times the data for 1.9x the issue cost of `ds_read_b32`. Global loads measure 116 cycles from a 4 KB working set, 283 from 1 MB and ~470 from 8 MB upward. `s_memtime` calibrates to 2.64 GHz. The full ISA reference, the complete opcode list from AMD's machine-readable RDNA2 spec, the hazard rules and the inline-assembly guide are in the project skill at `.opencode/skills/write-isa/SKILL.md`.
+
+The reference for the training shapes is `docs/torch-gemm-reference.md`: the exact `rocblas_gemm_ex` calls torch makes, the Tensile kernels it selects (128x128x16 for the up projection, 128x256x16 for the down projection) and how they compare with `LinearActFast`.
 
 The worked example is the fp16 GEMM: the compiler's fp32 path is LDS-bound at 5.25 TFLOP/s, and a hand-written `v_dot2_f32_f16` path with K-contiguous half tiles reaches 8.53 TFLOP/s. The same instruction on the wrong layout is slower, so every hand-written sequence is benchmarked against the compiler's.
 
@@ -228,3 +232,5 @@ An installation can compile gfx1031 code and still fail to detect the card. The 
 | `BUILD_PROFILING_TOOLS` | `OFF` | Build `OpenClProbe` for the profiling skill |
 | `BUILD_ISA_BENCH` | `ON` | Build the RDNA2 instruction microbenchmark |
 | `ROCMKERNELS_EMIT_ASSEMBLY` | `ON` | Provide the `ROCmKernels.Assembly` target |
+
+
